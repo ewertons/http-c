@@ -1,0 +1,3 @@
+[submodule "deps/common-lib-c"]
+	path = deps/common-lib-c
+	url = https://github.com/ewertons/common-lib-c

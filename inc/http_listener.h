@@ -1,6 +1,9 @@
 #ifndef HTTP_LISTENER
 #define HTTP_LISTENER
 
+#include <stdlib.h>
+#include <stdbool.h>
+#include "socket.h"
 
 typedef enum http_method
 {
@@ -10,10 +13,15 @@ typedef enum http_method
     DELETE
 } http_method_t;
 
-
 typedef struct http_server_config
 {
     int port;
+    struct
+    {
+        bool enable;
+        const char* certificate_file;
+        const char* private_key_file;
+    } tls;
 } http_server_config_t;
 
 typedef struct http_request
@@ -33,11 +41,12 @@ typedef struct http_route
 
 typedef struct http_server
 {
-    int a;
+    socket_config_t socket_config;
+    socket_t socket;
 } http_server_t;
 
 
-void http_server_init(http_server_t* server, http_server_config_t* config);
+int http_server_init(http_server_t* server, http_server_config_t* config);
 
 void http_server_run(http_server_t* server);
 

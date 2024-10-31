@@ -11,7 +11,7 @@ add_executable(
 
 target_link_libraries(
     sample
-        http_listener
+        http
         common-lib-c
         ${OPENSSL_LIBRARIES}
 )

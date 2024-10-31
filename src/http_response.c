@@ -2,44 +2,172 @@
 #include <http_response.h>
 #include <span.h>
 
-HL_RESULT http_response_init(http_response_t* response, http_request_t* request, span_t code, span_t reason_phrase)
+result_t http_response_init(http_response_t* response, span_t buffer, span_t http_version, span_t code, span_t reason_phrase)
 {
-    HL_RESULT result;
+    result_t result;
 
-    if (request == NULL || response == NULL)
+    if (response == NULL || span_is_empty(buffer) || span_is_empty(http_version) || span_is_empty(code) || span_is_empty(reason_phrase))
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
-        response->request = request;
-        response->code = code;
-        response->reason_phrase = reason_phrase;
-        response->headers = NULL;
-        response->body = SPAN_EMPTY;
+        response->buffer = buffer;
 
-        result = HL_RESULT_OK;
+        if (span_is_empty(span_copy(buffer, http_version, &buffer)))
+        {
+            result = insufficient_size;
+        }
+        else if (span_is_empty(span_copy(buffer, space, &buffer)))
+        {
+            result = insufficient_size;
+        }
+        else if (span_is_empty(span_copy(buffer, code, &buffer)))
+        {
+            result = insufficient_size;
+        }
+        else if (span_is_empty(span_copy(buffer, space, &buffer)))
+        {
+            result = insufficient_size;
+        }
+        else if (span_is_empty(span_copy(buffer, reason_phrase, &buffer)))
+        {
+            result = insufficient_size;
+        }
+        else if (span_is_empty(span_copy(buffer, crlf, &buffer)))
+        {
+            result = insufficient_size;
+        }
+        else
+        {
+            response->used_size = span_get_size(response->buffer) - span_get_size(buffer);
+            response->headers = NULL;
+            response->body = SPAN_EMPTY;
+            result = ok;
+        }
     }
 
     return result;
 }
 
-span_t http_response_get_code(http_response_t response)
+result_t http_response_get_code(http_response_t response, span_t* code)
 {
-    return response.code;
+    result_t result;
+
+    if (response.used_size == 0 || span_get_size(response.buffer) == 0 || code == NULL)
+    {
+        result = invalid_argument;
+    }
+    else
+    {
+        span_t buffer = span_slice(response.buffer, 0, response.used_size);
+        span_t data;
+
+        if(is_error(span_iterate(buffer, space, &data, &buffer)))
+        {
+            result = not_found;
+        }
+        else if (span_is_empty(data))
+        {
+            result = not_found;
+        }
+        else if(is_error(span_iterate(buffer, space, &data, &buffer)))
+        {
+            result = not_found;
+        }
+        else if (span_is_empty(data))
+        {
+            result = not_found;
+        }
+        else
+        {
+            *code = data;
+            result = ok;
+        }
+    }
+
+    return result;
 }
 
-span_t http_response_get_reason_phrase(http_response_t response)
+result_t http_response_get_reason_phrase(http_response_t response, span_t* reason_phrase)
 {
-    return response.reason_phrase;
+    result_t result;
+
+    if (response.used_size == 0 || span_get_size(response.buffer) == 0 || reason_phrase == NULL)
+    {
+        result = invalid_argument;
+    }
+    else
+    {
+        span_t buffer = span_slice(response.buffer, 0, response.used_size);
+        span_t data;
+
+        if(is_error(span_iterate(buffer, space, &data, &buffer)))
+        {
+            result = not_found;
+        }
+        else if (span_is_empty(data))
+        {
+            result = not_found;
+        }
+        else if(is_error(span_iterate(buffer, space, &data, &buffer)))
+        {
+            result = not_found;
+        }
+        else if (span_is_empty(data))
+        {
+            result = not_found;
+        }
+        else if(is_error(span_iterate(buffer, crlf, &data, &buffer)))
+        {
+            result = not_found;
+        }
+        else if (span_is_empty(data))
+        {
+            result = not_found;
+        }
+        else
+        {
+            *reason_phrase = data;
+            result = ok;
+        }
+    }
+
+    return result;
 }
 
-span_t http_response_get_http_version(http_response_t response)
+result_t http_response_get_http_version(http_response_t response, span_t* http_version)
 {
-    return response.request->version;
+    result_t result;
+
+    if (response.used_size == 0 || span_get_size(response.buffer) == 0 || http_version == NULL)
+    {
+        result = invalid_argument;
+    }
+    else
+    {
+        span_t buffer = span_slice(response.buffer, 0, response.used_size);
+        span_t data;
+
+        if(is_error(span_iterate(buffer, space, &data, &buffer)))
+        {
+            result = not_found;
+        }
+        else if (span_is_empty(data))
+        {
+            result = not_found;
+        }
+        else
+        {
+            *http_version = data;
+            result = ok;
+        }
+    }
+
+    return result;
 }
 
-HL_RESULT http_response_set_headers(http_response_t* response, http_headers_t* headers)
+result_t http_response_set_headers(http_response_t* response, http_headers_t* headers)
 {
     HL_RESULT result;
 
@@ -57,7 +185,7 @@ HL_RESULT http_response_set_headers(http_response_t* response, http_headers_t* h
     return result;
 }
 
-HL_RESULT http_response_get_headers(http_response_t response, http_headers_t** headers)
+result_t http_response_get_headers(http_response_t response, http_headers_t** headers)
 {
     HL_RESULT result;
 
@@ -75,7 +203,7 @@ HL_RESULT http_response_get_headers(http_response_t response, http_headers_t** h
     return result;
 }
 
-HL_RESULT http_response_set_body(http_response_t* response, span_t body)
+result_t http_response_set_body(http_response_t* response, span_t body)
 {
     // uint8_t raw_buffer[64];
     // buffer buffer = buffer_from_array(raw_buffer);
@@ -100,12 +228,4 @@ HL_RESULT http_response_set_body(http_response_t* response, span_t body)
     }
 
     return result;
-}
-
-void http_response_deinit(http_response_t* request)
-{
-    if (request != NULL)
-    {
-        
-    }
 }

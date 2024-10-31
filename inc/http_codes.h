@@ -3,6 +3,8 @@
 
 #include <span.h>
 
+static const span_t HTTP_VERSION_1_1 = span_from_str_literal("HTTP/1.1");
+
 static const span_t HTTP_CODE_200 = span_from_str_literal("200");
 static const span_t HTTP_CODE_201 = span_from_str_literal("201");
 static const span_t HTTP_CODE_202 = span_from_str_literal("202");

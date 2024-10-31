@@ -1,13 +1,14 @@
 #include <stddef.h>
+
 #include <span.h>
 #include "niceties.h"
+
 #include <http_request.h>
+#include "common.h"
 
 static int parse_request(http_request_t *request)
 {
     int result;
-    span_t crlf = span_from_str_literal("\r\n");
-    span_t space = span_from_str_literal(" ");
 
     span_t raw_request = request->buffer;
 
@@ -50,7 +51,7 @@ HL_RESULT http_request_get_buffer(http_request_t *request, span_t* buffer)
     return result;
 }
 
-HL_RESULT http_request_set_buffer(http_request_t *request, span_t buffer)
+HL_RESULT http_request_parse(http_request_t *request, span_t buffer)
 {
     HL_RESULT result;
 
@@ -109,7 +110,7 @@ HL_RESULT http_request_get_http_version(http_request_t *request, span_t* version
     return result;
 }
 
-HL_RESULT http_request_get_uri(http_request_t *request, span_t* path)
+HL_RESULT http_request_get_path(http_request_t *request, span_t* path)
 {
     HL_RESULT result;
 

@@ -19,13 +19,13 @@ typedef struct http_request
 
 HL_RESULT http_request_get_buffer(http_request_t* request, span_t* buffer);
 
-HL_RESULT http_request_set_buffer(http_request_t* request, span_t buffer);
+HL_RESULT http_request_parse(http_request_t* request, span_t buffer);
 
 HL_RESULT http_request_get_method(http_request_t* request, span_t* method);
 
 HL_RESULT http_request_get_http_version(http_request_t* request, span_t* version);
 
-HL_RESULT http_request_get_uri(http_request_t* request, span_t* path);
+HL_RESULT http_request_get_path(http_request_t* request, span_t* path);
 
 HL_RESULT http_request_get_headers(http_request_t* request, http_headers_t* headers);
 

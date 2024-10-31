@@ -13,8 +13,9 @@ int main()
 {
   int result = 0;
 
-  result += test_http_request();
   result += test_http_headers();
+  result += test_http_request();
+  result += test_http_response();
 
   return result;
 }

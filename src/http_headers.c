@@ -1,10 +1,11 @@
 #include <stddef.h>
-#include <http_headers.h>
+
+#include "http_headers.h"
+#include "common.h"
+
 #include <span.h>
 #include "niceties.h"
 
-static const span_t crlf = span_from_str_literal("\r\n");
-static const span_t nvsep = span_from_str_literal(": ");
 
 HL_RESULT http_headers_init(http_headers_t* headers, span_t buffer)
 {
@@ -96,7 +97,7 @@ HL_RESULT http_headers_get_next(http_headers_t* headers, span_t* name, span_t* v
                 }
                 else
                 {
-                    if (span_split(current_header, 0, nvsep, name, value) != 0)
+                    if (span_split(current_header, 0, name_value_separator, name, value) != 0)
                     {
                         result = HL_RESULT_ERROR;
                     }
@@ -135,7 +136,7 @@ HL_RESULT http_headers_find(http_headers_t* headers, span_t name, span_t* value)
         {
             span_t current_header_name, current_header_value;
 
-            if (span_split(current_header, 0, nvsep, &current_header_name, &current_header_value) != 0)
+            if (span_split(current_header, 0, name_value_separator, &current_header_name, &current_header_value) != 0)
             {
                 result = HL_RESULT_ERROR;
             }
@@ -167,7 +168,7 @@ HL_RESULT http_headers_add(http_headers_t* headers, span_t name, span_t value)
         {
             result = HL_RESULT_BUFFER_OVERFLOW;
         }
-        else if (span_is_empty(span_copy(free_buffer, nvsep, &free_buffer)))
+        else if (span_is_empty(span_copy(free_buffer, name_value_separator, &free_buffer)))
         {
             result = HL_RESULT_BUFFER_OVERFLOW;
         }

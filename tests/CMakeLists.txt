@@ -13,8 +13,9 @@ include_directories(${CMAKE_CURRENT_LIST_DIR} ${CMOCKA_PUBLIC_INCLUDE_DIRS})
 
 add_executable(${TARGET_NAME}
                 main.c
-                test_http_request.c
                 test_http_headers.c
+                test_http_request.c
+                test_http_response.c
 )
 
 target_link_libraries(${TARGET_NAME} http common-lib-c cmocka)

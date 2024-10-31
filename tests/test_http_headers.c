@@ -55,10 +55,17 @@ static void http_headers_parse_succeed(void **state)
 
   assert_int_equal(http_headers_parse(&headers, b), HL_RESULT_OK);
 
-  for (uint32_t i = 0; i < 3; i++)
-  {
-    assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_OK);
-  }
+  assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_OK);
+  assert_int_equal(span_compare(name, header_name_1), 0);
+  assert_int_equal(span_compare(value, header_value_1), 0);
+
+  assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_OK);
+  assert_int_equal(span_compare(name, header_name_2), 0);
+  assert_int_equal(span_compare(value, header_value_2), 0);
+
+  assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_OK);
+  assert_int_equal(span_compare(name, header_name_3), 0);
+  assert_int_equal(span_compare(value, header_value_3), 0);
 
   assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_EOF);
 }
@@ -140,7 +147,7 @@ static void http_headers_get_name_and_value_succeed(void **state)
   }
 }
 
-static void http_headers_get_succeed(void **state)
+static void http_headers_get_buffer_succeed(void **state)
 {
   (void)state;
 
@@ -149,8 +156,11 @@ static void http_headers_get_succeed(void **state)
   span_t name, value;
 
   span_t b = span_from_string(headers_str);
+  span_t c;
 
-  assert_int_equal(http_headers_init(&headers, b), HL_RESULT_OK);
+  assert_int_equal(http_headers_parse(&headers, b), HL_RESULT_OK);
+  assert_int_equal(http_headers_get_buffer(&headers, &c), HL_RESULT_OK);
+  assert_int_equal(span_compare(c, b), 0);
 }
 
 static void http_headers_add_succeed(void **state)
@@ -198,7 +208,9 @@ int test_http_headers()
       cmocka_unit_test(http_headers_parse_succeed),
       cmocka_unit_test(http_headers_get_next_succeed),
       cmocka_unit_test(http_headers_get_name_and_value_succeed),
-      cmocka_unit_test(http_headers_add_succeed)
+      cmocka_unit_test(http_headers_add_succeed),
+      cmocka_unit_test(http_headers_get_buffer_succeed),
+      cmocka_unit_test(http_headers_add_overflow_fail)
       };
 
   return cmocka_run_group_tests_name("http_headers", tests, NULL, NULL);

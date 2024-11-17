@@ -1,0 +1,322 @@
+diff --git a/inc/http_server.h b/inc/http_server.h
+index 18f31b4..7583c21 100644
+--- a/inc/http_server.h
++++ b/inc/http_server.h
+@@ -13,6 +13,17 @@ typedef enum http_method
+     DELETE
+ } http_method_t;
+ 
++#define MAX_SERVER_ROUTE_COUNT 10
++
++typedef void (*http_request_handler_t)(http_request_t* request, void* user_context);
++
++typedef struct http_route
++{
++    http_method_t method;
++    char* path;
++    http_request_handler_t handler;
++} http_route_t;
++
+ typedef struct http_server_config
+ {
+     int port;
+@@ -22,6 +33,12 @@ typedef struct http_server_config
+         const char* certificate_file;
+         const char* private_key_file;
+     } tls;
++    struct
++    {
++        http_route_t list[MAX_SERVER_ROUTE_COUNT];
++        uint16_t count;
++    } routes;
++
+ } http_server_config_t;
+ 
+ typedef struct http_request
+@@ -30,15 +47,6 @@ typedef struct http_request
+     char* path;
+ } http_request_t;
+ 
+-typedef void (*http_request_handler_t)(http_request_t* request);
+-
+-typedef struct http_route
+-{
+-    http_method_t method;
+-    char* path;
+-    http_request_handler_t handler;
+-} http_route_t;
+-
+ typedef struct http_server
+ {
+     socket_config_t socket_config;
+@@ -46,11 +54,10 @@ typedef struct http_server
+ } http_server_t;
+ 
+ 
+-int http_server_init(http_server_t* server, http_server_config_t* config);
+-
+-void http_server_run(http_server_t* server);
++result_t http_server_init(http_server_t* server, http_server_config_t* config);
+ 
+-void http_server_add_route(http_server_t* server, http_method_t method, const char* path, http_request_handler_t handler);
++result_t http_server_run(http_server_t* server);
+ 
++result_t http_server_add_route(http_server_t* server, http_method_t method, const char* path, http_request_handler_t handler, void* user_context);
+ 
+ #endif // HTTP_LISTENER
+diff --git a/samples/main.c b/samples/main.c
+index ff60699..65ab4ff 100644
+--- a/samples/main.c
++++ b/samples/main.c
+@@ -4,8 +4,6 @@
+ #include "socket.h"
+ #include "common_lib_c.h"
+ 
+-
+-
+ static void a(http_request_t* request)
+ {
+     // do nothing.
+@@ -22,10 +20,10 @@ int main(int argc, char** argv)
+     http_server_t http_server;
+ 
+     http_server_init(&http_server, &http_server_config);
+-    http_server_add_route(&http_server, POST, "/cars/*/*/*", a);
++    http_server_add_route(&http_server, POST, "/cars/.*/.*/.*", a);
+     http_server_add_route(&http_server, GET, "/index.html", a);
+     http_server_add_route(&http_server, GET, "/", a);
+     http_server_run(&http_server);
+ 
+     return 0;
+-}
+\ No newline at end of file
++}
+diff --git a/src/http_server.c b/src/http_server.c
+index 819acf6..701023a 100644
+--- a/src/http_server.c
++++ b/src/http_server.c
+@@ -2,8 +2,12 @@
+ #include "span.h"
+ #include "http_server.h"
+ 
+-int http_server_init(http_server_t* server, http_server_config_t* config)
++result_t http_server_init(http_server_t* server, http_server_config_t* config)
+ {
++    result_t result;
++
++    (void)memset(server, 0, sizeof(http_server_t));
++
+     server->socket_config = socket_get_default_secure_listener_config();
+     server->socket_config.local.port = config->port;
+     server->socket_config.tls.enable = config->tls.enable;
+@@ -12,37 +16,153 @@ int http_server_init(http_server_t* server, http_server_config_t* config)
+ 
+     if (socket_init(&server->socket, &server->socket_config) != 0)
+     {
+-        return ERROR;
++        result = error;
+     }
+     else
+     {
+-        return OK;
++        result = ok;
+     }
++
++    return result;
+ }
+ 
+-void http_server_run(http_server_t* server)
++result_t http_server_add_route(http_server_t* server, http_method_t method, const char* path, http_request_handler_t handler, void* user_context)
+ {
+-    socket_t client_socket;
+-    socket_accept(&server->socket, &client_socket);
++    result_t result;
+ 
+-    uint8_t buffer_raw[1024];
+-    span_t buffer = span_from_memory(buffer_raw);
+-    span_t bytes_read;
+-
+-    while (true)
++    if (server == NULL || path == NULL || handler == NULL)
+     {
+-        socket_read(&client_socket, buffer, &bytes_read);
+-
+-        printf("Bytes read: %.*s\n", span_get_size(bytes_read), span_get_ptr(bytes_read));
++        result = invalid_argument;
++    }
++    else if (server->routes.count == MAX_SERVER_ROUTE_COUNT)
++    {
++        result = insufficient_size;
++    }
++    else
++    {
++        server->routes.list[server->routes.count].method = method;
++        server->routes.list[server->routes.count].path = path;
++        server->routes.list[server->routes.count].handler = handler;
++        server->routes.list[server->routes.count].user_context = user_context;
++        server->routes.count++;
+ 
+-        socket_write(&client_socket, bytes_read);
++        result = ok;
+     }
++
++    return result;
+ }
+ 
+-void http_server_add_route(http_server_t* server, http_method_t method, const char* path, http_request_handler_t handler)
++
++result_t http_server_run(http_server_t* server)
+ {
+-    (void)server;
+-    (void)method;
+-    (void)path;
+-    (void)handler;
++    result_t result;
++
++    if (server == NULL)
++    {
++        result = invalid_argument;
++    }
++    else
++    {
++        http_endpoint_config_t local_endpoint_config;
++        local_endpoint_config...;
++
++        while (true) // service
++        {
++            http_endpoint_t local_endpoint;
++
++            if (is_error(http_endpoint_init(&local_endpoint, &local_endpoint_config))
++            {
++                // error;
++                result = error;
++                break;
++            }
++
++            while(true) // Keep listening
++            {
++                http_connection_t connection;
++                result_t connection_result = http_endpoint_wait_for_connection(local_endpoint, &connection);
++
++                if (is_success(connection_result))
++                {
++                    http_request_t request;
++
++                    while (true) // current connection
++                    {
++                        result_t receive_result = http_connection_receive_request(connection, &request);
++
++                        if (success(receive_result))
++                        {
++                            for(int i = 0; i < server->routes.count; i++)
++                            {
++                                span_t route_method = get_method_as_span(server->routes.list[i].method);
++
++                                if (span_compare(route_method, request.method) == 0)
++                                {
++                                    span_t path_matches[5];
++                                    uint16_t number_of_matches;
++                                    if (span_regex_is_match(request.path, server->routes.list[i].path, &path_matches, sizeofarray(path_matches), &number_of_matches))
++                                    {
++                                        http_response_t response;
++                                        server->routes.list[i].handler(request, path_matches, number_of_matches, &response, server->routes.list[i].user_context);
++
++                                        if (is_error(http_connection_send_response(response)))
++                                        {
++                                            // error, need to kill connection...
++                                            // TODO: exit loop.
++                                        }
++
++                                        break;
++                                    }
++                                }
++                            }
++
++                            // Handle if no routes are matched.
++                            // TODO: check if request Connection header instructs to close connect, then do it.
++                        }
++                        else if (receive_result != try_again)
++                        {
++                            // log error
++                            break;
++                        }
++                    }  // current connection
++
++                    http_connection_close(connection);
++                }
++                else if (connection_result != try_again)
++                {
++                    // error
++                    break;
++                }
++            } // Keep listening
++
++            http_endpoint_deinit(&local_endpoint);
++
++        } // service
++    }
++
++    return result;
+ }
++
++
++// result_t http_server_run(http_server_t* server)
++// {
++//     result_t result = ok;
++
++//     socket_t client_socket;
++//     socket_accept(&server->socket, &client_socket);
++
++//     uint8_t buffer_raw[1024];
++//     span_t buffer = span_from_memory(buffer_raw);
++//     span_t bytes_read;
++
++//     while (true)
++//     {
++//         socket_read(&client_socket, buffer, &bytes_read);
++
++//         printf("Bytes read: %.*s\n", span_get_size(bytes_read), span_get_ptr(bytes_read));
++
++//         socket_write(&client_socket, bytes_read);
++//     }
++
++//     return result;
++// }
+\ No newline at end of file
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 6097db8..466baa9 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -16,6 +16,7 @@ add_executable(${TARGET_NAME}
+                 test_http_headers.c
+                 test_http_request.c
+                 test_http_response.c
++                test_http_server.c
+ )
+ 
+ target_link_libraries(${TARGET_NAME} http common-lib-c cmocka)
+diff --git a/tests/main.c b/tests/main.c
+index 863af59..c8cd530 100644
+--- a/tests/main.c
++++ b/tests/main.c
+@@ -16,6 +16,7 @@ int main()
+   result += test_http_headers();
+   result += test_http_request();
+   result += test_http_response();
++  result += test_http_server();
+ 
+   return result;
+ }
+\ No newline at end of file
+diff --git a/tests/test_http.h b/tests/test_http.h
+index 640dbbf..27b13d9 100644
+--- a/tests/test_http.h
++++ b/tests/test_http.h
+@@ -4,5 +4,6 @@
+ int test_http_request();
+ int test_http_headers();
+ int test_http_response();
++int test_http_server();
+ 
+ #endif // TEST_HTTPS_LISTENER_H
+\ No newline at end of file

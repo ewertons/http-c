@@ -1,6 +1,8 @@
 cmake_minimum_required (VERSION 3.18)
 project(http)
 
+enable_testing()
+
 add_subdirectory(deps/common-lib-c)
 
 set(
@@ -8,6 +10,8 @@ set(
     ${CMAKE_CURRENT_LIST_DIR}/src/http_headers.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_request.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_response.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/http_endpoint.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/http_connection.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_server.c
 )
 

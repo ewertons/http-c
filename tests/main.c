@@ -16,6 +16,8 @@ int main()
   result += test_http_headers();
   result += test_http_request();
   result += test_http_response();
+  result += test_http_server();
+  result += test_http_endpoint();
 
   return result;
 }

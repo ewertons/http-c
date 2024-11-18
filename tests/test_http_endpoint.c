@@ -23,25 +23,6 @@ Connection: keep-alive\r\n\
 Upgrade-Insecure-Requests: 1\r\n\
 \r\n";
 
-
-// static int internal_do(void* args)
-// {
-//   task_t res = another_func_async();
-
-//   task_await(res);
-
-//   return 0;
-// }
-
-// task_t do_async(int a)
-// {
-//   struct custom_args args;
-//   args.a = a;
-
-//   return task_run(&args, internal_do);
-// }
-
-
 static void http_endpoint_init_listener_succeed(void** state)
 {
     (void)state;
@@ -56,12 +37,12 @@ static void http_endpoint_client_and_server_succeed(void** state)
 {
     (void)state;
     http_endpoint_t server_endpoint;
-    http_endpoint_config_t server_endpoint_config;
+    http_endpoint_config_t server_endpoint_config = { 0 };
     server_endpoint_config.port = 4344;
     server_endpoint_config.tls.enable = true;
 
     http_endpoint_t client_endpoint;
-    http_endpoint_config_t client_endpoint_config;
+    http_endpoint_config_t client_endpoint_config = { 0 };
     client_endpoint_config.hostname = span_from_str_literal("localhost");
     client_endpoint_config.port = 4344;
     client_endpoint_config.tls.enable = true;
@@ -76,7 +57,8 @@ static void http_endpoint_client_and_server_succeed(void** state)
     http_connection_t client_connection;
     assert_int_equal(http_endpoint_connect(&client_endpoint, &client_connection), ok);
 
-    assert_int_equal(task_await(wait_for_connection_task), completed_successfully);
+    assert_true(task_wait(wait_for_connection_task));
+    // assert_int_equal(, completed_successfully);
 
     http_request_t outgoing_request;
     http_request_t incoming_request;

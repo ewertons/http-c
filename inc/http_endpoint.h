@@ -7,8 +7,6 @@
 #include "socket.h"
 #include "task.h"
 
-#include "http_connection.h"
-
 typedef struct http_endpoint_config
 {
     span_t hostname;
@@ -26,6 +24,8 @@ typedef struct http_endpoint
     socket_config_t socket_config;
     socket_t socket;
 } http_endpoint_t;
+
+#include "http_connection.h"
 
 result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* config);
 

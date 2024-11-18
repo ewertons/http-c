@@ -4,6 +4,7 @@
 #include <span.h>
 #include "niceties.h"
 
+#include "http_endpoint.h"
 #include "http_request.h"
 #include "http_response.h"
 
@@ -16,8 +17,12 @@ typedef struct http_connection_config
 
 typedef struct http_connection
 {
-
+    http_endpoint_t* endpoint;
 } http_connection_t;
+
+result_t http_connection_set_endpoint(http_connection_t* connection, http_endpoint_t* endpoint);
+
+result_t http_connection_get_endpoint(http_connection_t* connection, http_endpoint_t** endpoint);
 
 result_t http_connection_receive_request(http_connection_t* connection, http_request_t* request);
 

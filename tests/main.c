@@ -7,6 +7,8 @@
 
 #include <cmocka.h>
 
+#include "task.h"
+
 #include <test_http.h>
 
 int main()
@@ -17,7 +19,9 @@ int main()
   result += test_http_request();
   result += test_http_response();
   result += test_http_server();
+  task_platform_init();
   result += test_http_endpoint();
+  task_platform_deinit();
 
   return result;
 }

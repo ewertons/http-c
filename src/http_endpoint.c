@@ -44,28 +44,38 @@ result_t http_endpoint_wait_for_connection(http_endpoint_t* endpoint, http_conne
     return result;
 }
 
-typedef struct async_arg
-{
-    http_endpoint_t* endpoint;
-    http_connection_t* connection;
-} async_arg_t;
-
 static result_t internal_wait_for_connection_async(void* user_args, task_t* my_task)
 {
-    async_arg_t* arg = (async_arg_t*)user_args;
+    http_connection_t* connection = (http_connection_t*)user_args;
+    http_endpoint_t* endpoint;
 
-    return http_endpoint_wait_for_connection(arg->endpoint, arg->connection);
+    result_t result = http_connection_get_endpoint(connection, &endpoint);
+
+    if (is_error(result))
+    {
+        return result;
+    }
+    else
+    {
+        return http_endpoint_wait_for_connection(endpoint, connection);
+    }
 }
 
 task_t* http_endpoint_wait_for_connection_async(http_endpoint_t* endpoint, http_connection_t* connection)
 {
-    async_arg_t arg;
-    arg.endpoint = endpoint;
-    arg.connection = connection;
-
-    return task_run(internal_wait_for_connection_async, &arg);
+    if (endpoint == NULL || connection == NULL)
+    {
+        return NULL;
+    }
+    else if (is_error(http_connection_set_endpoint(connection, endpoint)))
+    {
+        return NULL;
+    }
+    else
+    {
+        return task_run(internal_wait_for_connection_async, connection);
+    }
 }
-
 
 result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* connection)
 {

@@ -38,7 +38,7 @@ result_t http_endpoint_wait_for_connection(http_endpoint_t* endpoint, http_conne
     }
     else
     {
-        result = ok;
+        result = socket_accept(&endpoint->socket, &connection->socket);
     }
 
     return result;
@@ -87,6 +87,7 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
     }
     else
     {
+        
         result = ok;
     }
 
@@ -103,7 +104,7 @@ result_t http_endpoint_deinit(http_endpoint_t* endpoint)
     }
     else
     {
-        result = ok;
+        result = socket_deinit(&endpoint->socket);
     }
 
     return result;

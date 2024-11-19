@@ -18,6 +18,7 @@ typedef struct http_connection_config
 typedef struct http_connection
 {
     http_endpoint_t* endpoint;
+    socket_t socket;
 } http_connection_t;
 
 result_t http_connection_set_endpoint(http_connection_t* connection, http_endpoint_t* endpoint);

@@ -7,8 +7,15 @@
 #include "socket.h"
 #include "task.h"
 
+typedef enum http_endpoint_role
+{
+    http_endpoint_client,
+    http_endpoint_server
+} http_endpoint_role_t;
+
 typedef struct http_endpoint_config
 {
+    http_endpoint_role_t role;
     span_t hostname;
     int port;
     struct
@@ -21,6 +28,7 @@ typedef struct http_endpoint_config
 
 typedef struct http_endpoint
 {
+    http_endpoint_role_t role;
     socket_config_t socket_config;
     socket_t socket;
 } http_endpoint_t;

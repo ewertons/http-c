@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 
 #include "span.h"
 #include "niceties.h"
@@ -16,13 +17,27 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
     }
     else
     {
-        endpoint->socket_config = socket_get_default_secure_listener_config();
-        endpoint->socket_config.local.port = config->port;
-        endpoint->socket_config.tls.enable = config->tls.enable;
-        endpoint->socket_config.tls.certificate_file = config->tls.certificate_file;
-        endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
-        
-        result = socket_init(&endpoint->socket, &endpoint->socket_config);
+        (void)memset(endpoint, 0, sizeof(http_endpoint_t));
+
+        if (endpoint->role == http_endpoint_server)
+        {
+            endpoint->socket_config = socket_get_default_secure_listener_config();
+            endpoint->socket_config.local.port = config->port;
+            endpoint->socket_config.tls.certificate_file = config->tls.certificate_file;
+            endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
+            
+            result = socket_init(&endpoint->socket, &endpoint->socket_config);
+        }
+        else // http_endpoint_client
+        {
+            endpoint->socket_config = socket_get_default_secure_client_config();
+            endpoint->socket_config.remote.hostname = config->hostname;
+            endpoint->socket_config.remote.port = config->port;
+            endpoint->socket_config.tls.certificate_file = config->tls.certificate_file;
+            endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
+
+            result = ok;
+        }
     }
 
     return result;
@@ -32,7 +47,7 @@ result_t http_endpoint_wait_for_connection(http_endpoint_t* endpoint, http_conne
 {
     result_t result;
 
-    if (endpoint == NULL)
+    if (endpoint == NULL || endpoint->role != http_endpoint_server)
     {
         result = invalid_argument;
     }
@@ -81,14 +96,20 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
 {
     result_t result;
 
-    if (endpoint == NULL)
+    if (endpoint == NULL || endpoint->role != http_endpoint_client)
     {
         result = invalid_argument;
     }
     else
     {
+        (void)memset(connection, 0, sizeof(http_connection_t));
+
+        result = socket_init(&connection->socket, &endpoint->socket_config);
         
-        result = ok;
+        if (is_success(result))
+        {
+            result = socket_connect(&connection->socket);
+        }
     }
 
     return result;

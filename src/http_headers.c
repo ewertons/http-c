@@ -27,13 +27,13 @@ HL_RESULT http_headers_init(http_headers_t* headers, span_t buffer)
     return result;
 }
 
-HL_RESULT http_headers_parse(http_headers_t* headers, span_t raw_headers)
+result_t http_headers_parse(http_headers_t* headers, span_t raw_headers)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (headers == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
@@ -41,7 +41,7 @@ HL_RESULT http_headers_parse(http_headers_t* headers, span_t raw_headers)
         headers->used_size = span_get_size(raw_headers);
         headers->iterator = raw_headers;
 
-        result = HL_RESULT_OK;
+        result = ok;
     }
 
     return result;

@@ -29,14 +29,14 @@ static void http_request_get_GET_succeed(void** state)
 
     span_t buffer =  span_from_string(TEST_HTTP_REQUEST_GET_1);
 
-    assert_int_equal(http_request_parse(&request, buffer), HL_RESULT_OK);
-    assert_int_equal(http_request_get_method(&request, &method), HL_RESULT_OK);
+    assert_int_equal(http_request_parse(&request, buffer), ok);
+    assert_int_equal(http_request_get_method(&request, &method), ok);
     assert_int_equal(span_compare(method, span_from_str_literal("GET")), 0);
 
-    assert_int_equal(http_request_get_path(&request, &uri), HL_RESULT_OK);
+    assert_int_equal(http_request_get_path(&request, &uri), ok);
     assert_int_equal(span_compare(uri, span_from_str_literal("/")), 0);
 
-    assert_int_equal(http_request_get_http_version(&request, &version), HL_RESULT_OK);
+    assert_int_equal(http_request_get_http_version(&request, &version), ok);
     assert_int_equal(span_compare(version, span_from_str_literal("1.1")), 0);
 }
 
@@ -50,9 +50,9 @@ static void http_request_get_GET_headers_succeed(void** state)
 
     span_t buffer =  span_from_string(TEST_HTTP_REQUEST_GET_1);
 
-    assert_int_equal(http_request_parse(&request, buffer), HL_RESULT_OK);
+    assert_int_equal(http_request_parse(&request, buffer), ok);
 
-    assert_int_equal(http_request_get_headers(&request, &headers), HL_RESULT_OK);
+    assert_int_equal(http_request_get_headers(&request, &headers), ok);
 
     for (int i = 0; i < 7; i++)
     {

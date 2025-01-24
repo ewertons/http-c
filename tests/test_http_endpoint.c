@@ -13,6 +13,12 @@
 
 #include <test_http.h>
 
+#define CLIENT_CERT_PATH "TBD"
+#define CLIENT_PK_PATH "TBD"
+#define SERVER_CERT_PATH "TBD"
+#define SERVER_PK_PATH "TBD"
+#define CA_CHAIN_PATH "TBD"
+
 static uint8_t TEST_HTTP_REQUEST_GET_1[] = "GET / HTTP/1.1\r\n\
 Host: localhost:1234\r\n\
 User-Agent: Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:75.0) Gecko/20100101 Firefox/75.0\r\n\
@@ -28,7 +34,7 @@ static void http_endpoint_init_listener_succeed(void** state)
     (void)state;
     http_endpoint_t local_endpoint;
     http_endpoint_config_t local_endpoint_config;
-    local_endpoint_config.port = 4344;
+    local_endpoint_config.local.port = 4344;
 
     assert_int_equal(http_endpoint_init(&local_endpoint, &local_endpoint_config), ok);
 }
@@ -37,15 +43,18 @@ static void http_endpoint_client_and_server_succeed(void** state)
 {
     (void)state;
     http_endpoint_t server_endpoint;
-    http_endpoint_config_t server_endpoint_config = { 0 };
-    server_endpoint_config.port = 4344;
-    server_endpoint_config.tls.enable = true;
+    http_endpoint_config_t server_endpoint_config = http_endpoint_get_default_secure_server_config();
+    server_endpoint_config.local.port = 4344;
+    server_endpoint_config.tls.certificate_file = SERVER_CERT_PATH;
+    server_endpoint_config.tls.private_key_file = SERVER_PK_PATH;
 
     http_endpoint_t client_endpoint;
-    http_endpoint_config_t client_endpoint_config = { 0 };
-    client_endpoint_config.hostname = span_from_str_literal("localhost");
-    client_endpoint_config.port = 4344;
-    client_endpoint_config.tls.enable = true;
+    http_endpoint_config_t client_endpoint_config = http_endpoint_get_default_secure_client_config();
+    client_endpoint_config.remote.hostname = span_from_str_literal("localhost");
+    client_endpoint_config.remote.port = server_endpoint_config.local.port;
+    client_endpoint_config.tls.certificate_file = CLIENT_CERT_PATH;
+    client_endpoint_config.tls.private_key_file = CLIENT_PK_PATH;
+    client_endpoint_config.tls.trusted_certificate_file = CA_CHAIN_PATH;
 
     assert_int_equal(http_endpoint_init(&server_endpoint, &server_endpoint_config), ok);
 

@@ -18,7 +18,7 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config)
         (void)memset(server, 0, sizeof(http_server_t));
 
         http_endpoint_config_t* local_endpoint_config = &server->local_endpoint_config;
-        local_endpoint_config->port = config->port;
+        local_endpoint_config->local.port = config->port;
         local_endpoint_config->tls.enable = config->tls.enable;
         local_endpoint_config->tls.certificate_file = config->tls.certificate_file;
         local_endpoint_config->tls.private_key_file = config->tls.private_key_file;

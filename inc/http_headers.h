@@ -76,7 +76,7 @@ typedef struct http_headers
 
 HL_RESULT http_headers_init(http_headers_t* headers, span_t buffer);
 
-HL_RESULT http_headers_parse(http_headers_t* headers, span_t raw_headers);
+result_t http_headers_parse(http_headers_t* headers, span_t raw_headers);
 
 HL_RESULT http_headers_find(http_headers_t* headers, span_t name, span_t* value);
 

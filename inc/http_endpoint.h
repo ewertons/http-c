@@ -16,13 +16,16 @@ typedef enum http_endpoint_role
 typedef struct http_endpoint_config
 {
     http_endpoint_role_t role;
-    span_t hostname;
-    int port;
+
+    local_host_config_t local;
+    remote_host_config_t remote;
+
     struct
     {
         bool enable;
         const char* certificate_file;
         const char* private_key_file;
+        const char* trusted_certificate_file;
     } tls;
 } http_endpoint_config_t;
 
@@ -34,6 +37,23 @@ typedef struct http_endpoint
 } http_endpoint_t;
 
 #include "http_connection.h"
+
+static inline http_endpoint_config_t http_endpoint_get_default_secure_server_config()
+{
+    http_endpoint_config_t config = { 0 };
+    config.role = http_endpoint_server;
+    config.tls.enable = true;
+    config.local.port = DEFAULT_LISTENING_PORT;
+    return config;
+}
+
+static inline http_endpoint_config_t http_endpoint_get_default_secure_client_config()
+{
+    http_endpoint_config_t config = { 0 };
+    config.role = http_endpoint_client;
+    config.tls.enable = true;
+    return config;
+}
 
 result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* config);
 

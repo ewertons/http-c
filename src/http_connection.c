@@ -2,6 +2,7 @@
 
 #include "span.h"
 #include "niceties.h"
+#include "socket_stream.h"
 
 #include "http_endpoint.h"
 #include "http_connection.h"
@@ -78,13 +79,21 @@ result_t http_connection_send_request(http_connection_t* connection, http_reques
 {
     result_t result;
 
-    if (connection == NULL)
+    if (connection == NULL || request == NULL)
     {
         result = invalid_argument;
     }
     else
     {
-        result = ok;
+        stream_t stream;
+
+        // TODO: move this to initialization.
+        result = socket_stream_initialize(&stream, &connection->socket);
+
+        if (is_success(result))
+        {
+            result = http_request_serialize_to(request, &stream);
+        }
     }
 
     return result;

@@ -6,162 +6,165 @@
 #include <http_request.h>
 #include "common.h"
 
-static int parse_request(http_request_t *request)
+static result_t parse_request(http_request_t *request)
 {
-    int result;
+    result_t result;
 
     span_t raw_request = request->buffer;
 
     if (span_split(raw_request, 0, space, &request->method, &raw_request) != 0)
     {
-        result = ERROR;
+        result = error;
     }
     else if (span_split(raw_request, 0, space, &request->path, &raw_request) != 0)
     {
-        result = ERROR;
+        result = error;
     }
     else if (span_split(raw_request, 0, crlf, &request->version, &raw_request) != 0)
     {
-        result = ERROR;
+        result = error;
     }
     else
     {
         request->version = span_slice_to_end(request->version, 5 /* sizeof("HTTP/") */);
         request->headers = raw_request;
-        result = OK;
+        result = ok;
     }
 
     return result;
 }
 
-HL_RESULT http_request_get_buffer(http_request_t *request, span_t* buffer)
+result_t http_request_get_buffer(http_request_t *request, span_t* buffer)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL || buffer == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
         *buffer = request->buffer;
-        result = HL_RESULT_OK;
+        result = ok;
     }
 
     return result;
 }
 
-HL_RESULT http_request_parse(http_request_t *request, span_t buffer)
+result_t http_request_parse(http_request_t *request, span_t buffer)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
         request->buffer = buffer;
 
-        if (parse_request(request) != OK)
-        {
-            result = HL_RESULT_ERROR;
-        }
-        else
-        {
-            result = HL_RESULT_OK;
-        }
+        result = parse_request(request);
     }
 
     return result;
 }
 
-HL_RESULT http_request_get_method(http_request_t *request, span_t* method)
+result_t http_request_get_method(http_request_t *request, span_t* method)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL || method == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
         *method = request->method;
-        result = HL_RESULT_OK;
+        result = ok;
     }
 
     return result;
 }
 
-HL_RESULT http_request_get_http_version(http_request_t *request, span_t* version)
+result_t http_request_get_http_version(http_request_t *request, span_t* version)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL || version == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
         *version = request->version;
-        result = HL_RESULT_OK;
+        result = ok;
     }
 
     return result;
 }
 
-HL_RESULT http_request_get_path(http_request_t *request, span_t* path)
+result_t http_request_get_path(http_request_t *request, span_t* path)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL || path == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
         *path = request->path;
-        result = HL_RESULT_OK;
+        result = ok;
     }
 
     return result;
 }
 
-HL_RESULT http_request_get_headers(http_request_t *request, http_headers_t *headers)
+result_t http_request_get_headers(http_request_t *request, http_headers_t *headers)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL || headers == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
-        if (http_headers_parse(headers, request->headers) != HL_RESULT_OK)
-        {
-            result = HL_RESULT_ERROR;
-        }
-        else
-        {
-            result = HL_RESULT_OK;
-        }
+        result = http_headers_parse(headers, request->headers);
     }
 
     return result;
 }
 
-HL_RESULT http_request_read_body(http_request_t *request, span_t* buffer)
+result_t http_request_read_body(http_request_t *request, span_t* buffer)
 {
-    HL_RESULT result;
+    result_t result;
 
     if (request == NULL || buffer == NULL)
     {
-        result = HL_RESULT_INVALID_ARG;
+        result = invalid_argument;
     }
     else
     {
-        result = HL_RESULT_ERROR;
+        result = error;
     }
 
     return result;   
+}
+
+result_t http_request_serialize_to(http_request_t* request, stream_t* stream)
+{
+    result_t result;
+
+    if (request == NULL || stream == NULL)
+    {
+        result = invalid_argument;
+    }
+    else
+    {
+
+        result = ok;
+    }
+
+    return result;
 }

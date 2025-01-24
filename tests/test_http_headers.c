@@ -53,7 +53,7 @@ static void http_headers_parse_succeed(void **state)
 
   span_t b = span_from_string(headers_str);
 
-  assert_int_equal(http_headers_parse(&headers, b), HL_RESULT_OK);
+  assert_int_equal(http_headers_parse(&headers, b), ok);
 
   assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_OK);
   assert_int_equal(span_compare(name, header_name_1), 0);
@@ -79,7 +79,7 @@ static void http_headers_get_next_succeed(void **state)
 
   span_t b = span_from_string(headers_str);
 
-  assert_int_equal(http_headers_parse(&headers, b), HL_RESULT_OK);
+  assert_int_equal(http_headers_parse(&headers, b), ok);
 
   for (uint32_t n = 0; n < 100; n++)
   {
@@ -101,7 +101,7 @@ static void http_headers_get_name_and_value_succeed(void **state)
 
   span_t b = span_from_string(headers_str);
 
-  assert_int_equal(http_headers_parse(&headers, b), HL_RESULT_OK);
+  assert_int_equal(http_headers_parse(&headers, b), ok);
 
   for (uint32_t n = 0; n < 3; n++)
   {
@@ -158,7 +158,7 @@ static void http_headers_get_buffer_succeed(void **state)
   span_t b = span_from_string(headers_str);
   span_t c;
 
-  assert_int_equal(http_headers_parse(&headers, b), HL_RESULT_OK);
+  assert_int_equal(http_headers_parse(&headers, b), ok);
   assert_int_equal(http_headers_get_buffer(&headers, &c), HL_RESULT_OK);
   assert_int_equal(span_compare(c, b), 0);
 }

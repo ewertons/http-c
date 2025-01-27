@@ -14,4 +14,5 @@ target_link_libraries(
         http
         common-lib-c
         ${OPENSSL_LIBRARIES}
+        pthread
 )

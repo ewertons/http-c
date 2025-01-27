@@ -1,4 +1,6 @@
 #include <stdlib.h>
+#include <string.h>
+
 #include "span.h"
 #include "http_server.h"
 #include "http_methods.h"

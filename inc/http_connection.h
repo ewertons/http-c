@@ -3,6 +3,8 @@
 
 #include <span.h>
 #include "niceties.h"
+#include "stream.h"
+#include "socket.h"
 
 #include "http_endpoint.h"
 #include "http_request.h"
@@ -19,6 +21,7 @@ typedef struct http_connection
 {
     http_endpoint_t* endpoint;
     socket_t socket;
+    stream_t stream;
 } http_connection_t;
 
 result_t http_connection_set_endpoint(http_connection_t* connection, http_endpoint_t* endpoint);

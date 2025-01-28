@@ -14,5 +14,6 @@ typedef enum HL_RESULT_ENUM
 static const span_t crlf = span_from_str_literal("\r\n");
 static const span_t name_value_separator = span_from_str_literal(": ");
 static const span_t space = span_from_str_literal(" ");
+static const span_t headers_terminator = span_from_str_literal("\r\n\r\n");
 
 #endif // COMMON_H

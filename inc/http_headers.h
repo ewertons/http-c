@@ -3,7 +3,9 @@
 
 #include <stdlib.h>
 #include <span.h>
+
 #include "common.h"
+#include "stream.h"
 
 // https://tools.ietf.org/html/rfc2616#page-100
 
@@ -86,5 +88,6 @@ HL_RESULT http_headers_get_buffer(http_headers_t* headers, span_t* buffer);
 
 HL_RESULT http_headers_add(http_headers_t* headers, span_t name, span_t value);
 
+result_t http_headers_serialize_to(http_headers_t* headers, stream_t* stream);
 
 #endif // http_headers_t_H

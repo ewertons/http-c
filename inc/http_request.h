@@ -15,8 +15,10 @@ typedef struct http_request
     span_t method;
     span_t path;
     span_t version;
-    span_t headers;
+    http_headers_t headers;
 } http_request_t;
+
+result_t http_request_initialize(http_request_t *request, span_t method, span_t path, span_t version, http_headers_t headers);
 
 result_t http_request_get_buffer(http_request_t* request, span_t* buffer);
 

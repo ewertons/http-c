@@ -38,7 +38,7 @@ result_t http_headers_parse(http_headers_t* headers, span_t raw_headers)
     else
     {
         headers->buffer = raw_headers;
-        headers->used_size = span_get_size(raw_headers);
+        headers->used_size = span_get_size(raw_headers); // TODO: get the size up to crlf crlf or end.
         headers->iterator = raw_headers;
 
         result = ok;
@@ -186,6 +186,26 @@ HL_RESULT http_headers_add(http_headers_t* headers, span_t name, span_t value)
 
             result = HL_RESULT_OK;
         }
+    }
+
+    return result;
+}
+
+result_t http_headers_serialize_to(http_headers_t* headers, stream_t* stream)
+{
+    result_t result;
+
+    if (headers == NULL || stream == NULL)
+    {
+        result = invalid_argument;
+    }
+    else if (failed(stream_write(stream, span_slice(headers->buffer, 0, headers->used_size), NULL)))
+    {
+        result = error;
+    }
+    else
+    {
+        result = ok;
     }
 
     return result;

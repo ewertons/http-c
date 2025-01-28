@@ -10,6 +10,8 @@
 
 #include <http_request.h>
 #include "http_endpoint.h"
+#include "http_methods.h"
+#include "http_versions.h"
 
 #include <test_http.h>
 
@@ -29,14 +31,20 @@ Connection: keep-alive\r\n\
 Upgrade-Insecure-Requests: 1\r\n\
 \r\n";
 
+static uint8_t test_raw_buffer[1024];
+
+static span_t HTTP_HEADER_USER_AGENT_VALUE = span_from_str_literal("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:75.0) Gecko/20100101 Firefox/75.0");
+static span_t HTTP_HEADER_CONNECTION_VALUE = span_from_str_literal("keep-alive");
+
 static void http_endpoint_init_listener_succeed(void** state)
 {
     (void)state;
     http_endpoint_t local_endpoint;
-    http_endpoint_config_t local_endpoint_config;
-    local_endpoint_config.local.port = 4344;
+    http_endpoint_config_t local_endpoint_config = http_endpoint_get_default_secure_server_config();
+    local_endpoint_config.local.port = 4343;
 
     assert_int_equal(http_endpoint_init(&local_endpoint, &local_endpoint_config), ok);
+    assert_int_equal(http_endpoint_deinit(&local_endpoint), ok);
 }
 
 static void http_endpoint_client_and_server_succeed(void** state)
@@ -69,7 +77,13 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_true(task_wait(wait_for_connection_task));
     // assert_int_equal(, completed_successfully);
 
+    http_headers_t outgoing_request_headers;
+    assert_int_equal(http_headers_init(&outgoing_request_headers, span_from_memory(test_raw_buffer)), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_USER_AGENT, HTTP_HEADER_USER_AGENT_VALUE), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_CONNECTION, HTTP_HEADER_CONNECTION_VALUE), HL_RESULT_OK);
     http_request_t outgoing_request;
+    assert_int_equal(http_request_initialize(&outgoing_request, HTTP_METHOD_GET, span_from_str_literal("/"), HTTP_VERSION_1_1, outgoing_request_headers), ok);
+
     http_request_t incoming_request;
     http_response_t outgoing_response;
     http_response_t incoming_response;

@@ -53,7 +53,23 @@ result_t http_connection_receive_request(http_connection_t* connection, http_req
     }
     else
     {
-        result = ok;
+        uint8_t raw_buffer[512];
+        span_t buffer = span_from_memory(raw_buffer);
+        span_t original_buffer = buffer;
+        span_t bytes_read;
+        
+        while (succeeded(result = stream_read(&connection->stream, buffer, &bytes_read, &buffer)))
+        {
+            printf("READ (%d): %.*s\r\n", span_get_size(bytes_read), span_get_size(bytes_read), span_get_ptr(bytes_read));
+
+            bytes_read = span_slice_out(original_buffer, buffer);
+
+            if (span_find_reverse(bytes_read, -1, headers_terminator) != -1)
+            {
+                result = http_request_parse(request, bytes_read);
+                break;
+            }
+        }
     }
 
     return result;
@@ -85,15 +101,7 @@ result_t http_connection_send_request(http_connection_t* connection, http_reques
     }
     else
     {
-        stream_t stream;
-
-        // TODO: move this to initialization.
-        result = socket_stream_initialize(&stream, &connection->socket);
-
-        if (is_success(result))
-        {
-            result = http_request_serialize_to(request, &stream);
-        }
+        result = http_request_serialize_to(request, &connection->stream);
     }
 
     return result;

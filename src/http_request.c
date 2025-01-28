@@ -1,7 +1,9 @@
 #include <stddef.h>
+#include <string.h>
 
 #include <span.h>
 #include "niceties.h"
+#include "stream.h"
 
 #include <http_request.h>
 #include "common.h"
@@ -27,7 +29,28 @@ static result_t parse_request(http_request_t *request)
     else
     {
         request->version = span_slice_to_end(request->version, 5 /* sizeof("HTTP/") */);
-        request->headers = raw_request;
+        result = http_headers_parse(&request->headers, raw_request);
+    }
+
+    return result;
+}
+
+result_t http_request_initialize(http_request_t *request, span_t method, span_t path, span_t version, http_headers_t headers)
+{
+    result_t result;
+
+    if (request == NULL || span_is_empty(method) || span_is_empty(path) || span_is_empty(version))
+    {
+        result = invalid_argument;
+    }
+    else
+    {
+        (void)memset(request, 0, sizeof(http_request_t));
+        request->method = method;
+        request->path = path;
+        request->version = version;
+        request->headers = headers;
+
         result = ok;
     }
 
@@ -130,7 +153,8 @@ result_t http_request_get_headers(http_request_t *request, http_headers_t *heade
     }
     else
     {
-        result = http_headers_parse(headers, request->headers);
+        *headers = request->headers;
+        result = ok;
     }
 
     return result;
@@ -162,8 +186,48 @@ result_t http_request_serialize_to(http_request_t* request, stream_t* stream)
     }
     else
     {
+        span_t raw_headers;
 
-        result = ok;
+        if (failed(stream_write(stream, request->method, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, space, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, request->path, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, space, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, request->version, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, crlf, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(http_headers_serialize_to(&request->headers, stream)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, crlf, NULL)))
+        {
+            result = error;
+        }
+        else if (failed(stream_write(stream, crlf, NULL)))
+        {
+            result = error;
+        }
+        else
+        {
+            result = ok;
+        }
     }
 
     return result;

@@ -4,6 +4,7 @@
 #include "span.h"
 #include "niceties.h"
 #include "socket.h"
+#include "socket_stream.h"
 
 #include "http_endpoint.h"
 
@@ -54,7 +55,12 @@ result_t http_endpoint_wait_for_connection(http_endpoint_t* endpoint, http_conne
     }
     else
     {
-        result = socket_accept(&endpoint->socket, &connection->socket);
+        (void)memset(connection, 0, sizeof(http_connection_t));
+
+        if (is_success(result = socket_accept(&endpoint->socket, &connection->socket)))
+        {
+             result = socket_stream_initialize(&connection->stream, &connection->socket);
+        }
     }
 
     return result;
@@ -109,7 +115,10 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
         
         if (is_success(result))
         {
-            result = socket_connect(&connection->socket);
+            if (is_success(result = socket_connect(&connection->socket)))
+            {
+                result = socket_stream_initialize(&connection->stream, &connection->socket);
+            }
         }
     }
 

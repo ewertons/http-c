@@ -69,7 +69,7 @@ HL_RESULT http_headers_get_next(http_headers_t* headers, span_t* name, span_t* v
 {
     HL_RESULT result;
 
-    if (headers == NULL || headers == NULL)
+    if (headers == NULL)
     {
         result = HL_RESULT_INVALID_ARG;
     }

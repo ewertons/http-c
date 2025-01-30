@@ -28,7 +28,7 @@ static result_t parse_request(http_request_t *request)
     }
     else
     {
-        request->version = span_slice_to_end(request->version, 5 /* sizeof("HTTP/") */);
+        // request->version = span_slice_to_end(request->version, 5 /* sizeof("HTTP/") */);
         result = http_headers_parse(&request->headers, raw_request);
     }
 
@@ -74,6 +74,7 @@ result_t http_request_get_buffer(http_request_t *request, span_t* buffer)
     return result;
 }
 
+// TODO: return remainder of buffer that has not been parsed.
 result_t http_request_parse(http_request_t *request, span_t buffer)
 {
     result_t result;

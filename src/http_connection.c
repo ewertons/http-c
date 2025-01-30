@@ -43,7 +43,7 @@ result_t http_connection_get_endpoint(http_connection_t* connection, http_endpoi
     return result;
 }
 
-result_t http_connection_receive_request(http_connection_t* connection, http_request_t* request)
+result_t http_connection_receive_request(http_connection_t* connection, span_t buffer, http_request_t* request, span_t* out_buffer_remainder)
 {
     result_t result;
 
@@ -53,20 +53,22 @@ result_t http_connection_receive_request(http_connection_t* connection, http_req
     }
     else
     {
-        uint8_t raw_buffer[512];
-        span_t buffer = span_from_memory(raw_buffer);
         span_t original_buffer = buffer;
         span_t bytes_read;
         
         while (succeeded(result = stream_read(&connection->stream, buffer, &bytes_read, &buffer)))
         {
-            printf("READ (%d): %.*s\r\n", span_get_size(bytes_read), span_get_size(bytes_read), span_get_ptr(bytes_read));
-
             bytes_read = span_slice_out(original_buffer, buffer);
 
             if (span_find_reverse(bytes_read, -1, headers_terminator) != -1)
             {
                 result = http_request_parse(request, bytes_read);
+
+                if (out_buffer_remainder != NULL)
+                {
+                    *out_buffer_remainder = buffer;
+                }
+
                 break;
             }
         }

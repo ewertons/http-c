@@ -84,12 +84,33 @@ static void http_endpoint_client_and_server_succeed(void** state)
     http_request_t outgoing_request;
     assert_int_equal(http_request_initialize(&outgoing_request, HTTP_METHOD_GET, span_from_str_literal("/"), HTTP_VERSION_1_1, outgoing_request_headers), ok);
 
+    uint8_t raw_buffer[512];
+    span_t buffer = span_from_memory(raw_buffer);
+
     http_request_t incoming_request;
     http_response_t outgoing_response;
     http_response_t incoming_response;
+    span_t header_name, header_value;
 
     assert_int_equal(http_connection_send_request(&client_connection, &outgoing_request), ok);
-    assert_int_equal(http_connection_receive_request(&server_connection, &incoming_request), ok);
+
+    assert_int_equal(http_connection_receive_request(&server_connection, buffer, &incoming_request, &buffer), ok);
+    assert_int_equal(span_compare(incoming_request.method, HTTP_METHOD_GET), 0);
+    assert_int_equal(span_compare(incoming_request.path, span_from_str_literal("/")), 0);
+    assert_int_equal(span_compare(incoming_request.version, HTTP_VERSION_1_1), 0);
+
+    assert_int_equal(http_headers_get_next(&incoming_request.headers, &header_name, &header_value), HL_RESULT_OK);
+    assert_int_equal(span_get_size(header_name), span_get_size(HTTP_HEADER_USER_AGENT)); 
+    assert_memory_equal(span_get_ptr(header_name), span_get_ptr(HTTP_HEADER_USER_AGENT), span_get_size(HTTP_HEADER_USER_AGENT)); 
+    assert_int_equal(span_get_size(header_value), span_get_size(HTTP_HEADER_USER_AGENT_VALUE)); 
+    assert_memory_equal(span_get_ptr(header_value), span_get_ptr(HTTP_HEADER_USER_AGENT_VALUE), span_get_size(HTTP_HEADER_USER_AGENT_VALUE)); 
+    assert_int_equal(http_headers_get_next(&incoming_request.headers, &header_name, &header_value), HL_RESULT_OK);
+    assert_int_equal(span_get_size(header_name), span_get_size(HTTP_HEADER_CONNECTION)); 
+    assert_memory_equal(span_get_ptr(header_name), span_get_ptr(HTTP_HEADER_CONNECTION), span_get_size(HTTP_HEADER_CONNECTION)); 
+    assert_int_equal(span_get_size(header_value), span_get_size(HTTP_HEADER_CONNECTION_VALUE)); 
+    assert_memory_equal(span_get_ptr(header_value), span_get_ptr(HTTP_HEADER_CONNECTION_VALUE), span_get_size(HTTP_HEADER_CONNECTION_VALUE));
+    assert_int_equal(http_headers_get_next(&incoming_request.headers, &header_name, &header_value), HL_RESULT_EOF);
+
     assert_int_equal(http_connection_send_response(&server_connection, &outgoing_response), ok);
     assert_int_equal(http_connection_receive_response(&client_connection, &incoming_response), ok);
 

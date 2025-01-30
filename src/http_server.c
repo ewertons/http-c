@@ -111,9 +111,13 @@ result_t http_server_run(http_server_t* server)
                 {
                     http_request_t request;
 
+                    // TODO: remove this from here, make it an argument.
+                    uint8_t raw_buffer[512];
+                    span_t buffer = span_from_memory(raw_buffer);
+
                     while (true) // current connection
                     {
-                        result_t receive_result = http_connection_receive_request(&connection, &request);
+                        result_t receive_result = http_connection_receive_request(&connection, buffer, &request, &buffer);
 
                         if (is_success(receive_result))
                         {

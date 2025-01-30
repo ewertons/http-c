@@ -2,10 +2,15 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <setjmp.h>
-#include <cmocka.h>
 #include <inttypes.h>
+
+#include <cmocka.h>
+
 #include "niceties.h"
 #include <http_request.h>
+#include "http_versions.h"
+#include "http_methods.h"
+
 #include <test_http.h>
 
 static uint8_t TEST_HTTP_REQUEST_GET_1[] = "GET / HTTP/1.1\r\n\
@@ -31,13 +36,13 @@ static void http_request_get_GET_succeed(void** state)
 
     assert_int_equal(http_request_parse(&request, buffer), ok);
     assert_int_equal(http_request_get_method(&request, &method), ok);
-    assert_int_equal(span_compare(method, span_from_str_literal("GET")), 0);
+    assert_int_equal(span_compare(method, HTTP_METHOD_GET), 0);
 
     assert_int_equal(http_request_get_path(&request, &uri), ok);
     assert_int_equal(span_compare(uri, span_from_str_literal("/")), 0);
 
     assert_int_equal(http_request_get_http_version(&request, &version), ok);
-    assert_int_equal(span_compare(version, span_from_str_literal("1.1")), 0);
+    assert_int_equal(span_compare(version, HTTP_VERSION_1_1), 0);
 }
 
 static void http_request_get_GET_headers_succeed(void** state)

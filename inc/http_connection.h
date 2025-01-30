@@ -28,7 +28,7 @@ result_t http_connection_set_endpoint(http_connection_t* connection, http_endpoi
 
 result_t http_connection_get_endpoint(http_connection_t* connection, http_endpoint_t** endpoint);
 
-result_t http_connection_receive_request(http_connection_t* connection, http_request_t* request);
+result_t http_connection_receive_request(http_connection_t* connection, span_t buffer, http_request_t* request, span_t* out_buffer_remainder);
 
 result_t http_connection_send_response(http_connection_t* connection, http_response_t* response);
 

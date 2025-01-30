@@ -11,25 +11,57 @@
 
 typedef struct http_response 
 {
-    span_t buffer;
-    uint32_t used_size;
-    http_headers_t* headers;
-    span_t body;
+    span_t http_version;
+    span_t code;
+    span_t reason_phrase;
+    http_headers_t headers;
 } http_response_t;
 
+result_t http_response_initialize(http_response_t* response, span_t http_version, span_t code, span_t reason_phrase, http_headers_t headers);
 
-result_t http_response_init(http_response_t* response, span_t buffer, span_t http_version, span_t code, span_t reason_phrase);
+// TODO: Change all these to be accessors only... remove code.
 
-result_t http_response_get_code(http_response_t response, span_t* code);
+static inline result_t http_response_get_code(http_response_t response, span_t* code)
+{
+    if (code == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *code = response.code;
+        return ok;
+    }
+}
 
-result_t http_response_get_reason_phrase(http_response_t response, span_t* reason_phrase);
+static inline result_t http_response_get_reason_phrase(http_response_t response, span_t* reason_phrase)
+{
+    if (reason_phrase == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *reason_phrase = response.reason_phrase;
+        return ok;
+    }
+}
 
-result_t http_response_get_http_version(http_response_t response, span_t* http_version);
+static inline result_t http_response_get_http_version(http_response_t response, span_t* http_version)
+{
+    if (http_version == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *http_version = response.http_version;
+        return ok;
+    }
+}
 
-result_t http_response_set_headers(http_response_t* response, http_headers_t* headers);
+result_t http_response_parse(http_response_t* response, span_t raw_response, span_t* out_raw_response_remainder);
 
-result_t http_response_get_headers(http_response_t response, http_headers_t** headers);
-
-result_t http_response_set_body(http_response_t* response, span_t body);
+result_t http_response_serialize_to(http_response_t* response, stream_t* stream);
 
 #endif // HTTP_RESPONSE_H

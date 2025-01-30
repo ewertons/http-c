@@ -12,6 +12,7 @@
 #include "http_endpoint.h"
 #include "http_methods.h"
 #include "http_versions.h"
+#include "http_codes.h"
 
 #include <test_http.h>
 
@@ -31,10 +32,20 @@ Connection: keep-alive\r\n\
 Upgrade-Insecure-Requests: 1\r\n\
 \r\n";
 
+static uint8_t TEST_HTTP_RESPONSE_GET_1[] = "HTTP/1.1 200 OK\r\n\
+Server: http-c\r\n\
+Content-Type: text/html; charset=UTF-8\r\n\
+Content-Length: 42\r\n\
+\r\n";
+
 static uint8_t test_raw_buffer[1024];
 
 static span_t HTTP_HEADER_USER_AGENT_VALUE = span_from_str_literal("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:75.0) Gecko/20100101 Firefox/75.0");
 static span_t HTTP_HEADER_CONNECTION_VALUE = span_from_str_literal("keep-alive");
+
+static span_t HTTP_HEADER_SERVER_VALUE = span_from_str_literal("http-c");
+static span_t HTTP_HEADER_CONTENT_TYPE_VALUE = span_from_str_literal("text/html; charset=UTF-8");
+static span_t HTTP_HEADER_CONTENT_LENGTH_VALUE = span_from_str_literal("43");
 
 static void http_endpoint_init_listener_succeed(void** state)
 {
@@ -77,27 +88,25 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_true(task_wait(wait_for_connection_task));
     // assert_int_equal(, completed_successfully);
 
-    http_headers_t outgoing_request_headers;
-    assert_int_equal(http_headers_init(&outgoing_request_headers, span_from_memory(test_raw_buffer)), HL_RESULT_OK);
-    assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_USER_AGENT, HTTP_HEADER_USER_AGENT_VALUE), HL_RESULT_OK);
-    assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_CONNECTION, HTTP_HEADER_CONNECTION_VALUE), HL_RESULT_OK);
+    span_t test_buffer = span_from_memory(test_raw_buffer);
+
+    http_headers_t outgoing_request_headers, outgoing_response_headers;
     http_request_t outgoing_request;
-    assert_int_equal(http_request_initialize(&outgoing_request, HTTP_METHOD_GET, span_from_str_literal("/"), HTTP_VERSION_1_1, outgoing_request_headers), ok);
-
-    uint8_t raw_buffer[512];
-    span_t buffer = span_from_memory(raw_buffer);
-
     http_request_t incoming_request;
     http_response_t outgoing_response;
     http_response_t incoming_response;
     span_t header_name, header_value;
 
+    assert_int_equal(http_headers_init(&outgoing_request_headers, test_buffer), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_USER_AGENT, HTTP_HEADER_USER_AGENT_VALUE), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_CONNECTION, HTTP_HEADER_CONNECTION_VALUE), HL_RESULT_OK);
+    assert_int_equal(http_request_initialize(&outgoing_request, HTTP_METHOD_GET, span_from_str_literal("/"), HTTP_VERSION_1_1, outgoing_request_headers), ok);
     assert_int_equal(http_connection_send_request(&client_connection, &outgoing_request), ok);
 
-    assert_int_equal(http_connection_receive_request(&server_connection, buffer, &incoming_request, &buffer), ok);
+    assert_int_equal(http_connection_receive_request(&server_connection, test_buffer, &incoming_request, NULL), ok);
     assert_int_equal(span_compare(incoming_request.method, HTTP_METHOD_GET), 0);
     assert_int_equal(span_compare(incoming_request.path, span_from_str_literal("/")), 0);
-    assert_int_equal(span_compare(incoming_request.version, HTTP_VERSION_1_1), 0);
+    assert_int_equal(span_compare(incoming_request.http_version, HTTP_VERSION_1_1), 0);
 
     assert_int_equal(http_headers_get_next(&incoming_request.headers, &header_name, &header_value), HL_RESULT_OK);
     assert_int_equal(span_get_size(header_name), span_get_size(HTTP_HEADER_USER_AGENT)); 
@@ -111,8 +120,28 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_memory_equal(span_get_ptr(header_value), span_get_ptr(HTTP_HEADER_CONNECTION_VALUE), span_get_size(HTTP_HEADER_CONNECTION_VALUE));
     assert_int_equal(http_headers_get_next(&incoming_request.headers, &header_name, &header_value), HL_RESULT_EOF);
 
+    assert_int_equal(http_headers_init(&outgoing_response_headers, test_buffer), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_response_headers, HTTP_HEADER_SERVER, HTTP_HEADER_SERVER_VALUE), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_response_headers, HTTP_HEADER_CONTENT_TYPE, HTTP_HEADER_CONTENT_TYPE_VALUE), HL_RESULT_OK);
+    assert_int_equal(http_headers_add(&outgoing_response_headers, HTTP_HEADER_CONTENT_LENGTH, HTTP_HEADER_CONTENT_LENGTH_VALUE), HL_RESULT_OK);
+    assert_int_equal(http_response_initialize(&outgoing_response, HTTP_VERSION_1_1, HTTP_CODE_200, HTTP_REASON_PHRASE_200, outgoing_response_headers), ok);
     assert_int_equal(http_connection_send_response(&server_connection, &outgoing_response), ok);
-    assert_int_equal(http_connection_receive_response(&client_connection, &incoming_response), ok);
+
+    assert_int_equal(http_connection_receive_response(&client_connection, test_buffer, &incoming_response, NULL), ok);
+    assert_int_equal(span_compare(incoming_response.http_version, HTTP_VERSION_1_1), 0);
+    assert_int_equal(span_compare(incoming_response.code, HTTP_CODE_200), 0);
+    assert_int_equal(span_compare(incoming_response.reason_phrase, HTTP_REASON_PHRASE_200), 0);
+
+    assert_int_equal(http_headers_get_next(&incoming_response.headers, &header_name, &header_value), HL_RESULT_OK);
+    assert_int_equal(span_compare(header_name, HTTP_HEADER_SERVER), 0);
+    assert_int_equal(span_compare(header_value, HTTP_HEADER_SERVER_VALUE), 0);
+    assert_int_equal(http_headers_get_next(&incoming_response.headers, &header_name, &header_value), HL_RESULT_OK);
+    assert_int_equal(span_compare(header_name, HTTP_HEADER_CONTENT_TYPE), 0);
+    assert_int_equal(span_compare(header_value, HTTP_HEADER_CONTENT_TYPE_VALUE), 0);
+    assert_int_equal(http_headers_get_next(&incoming_response.headers, &header_name, &header_value), HL_RESULT_OK);
+    assert_int_equal(span_compare(header_name, HTTP_HEADER_CONTENT_LENGTH), 0);
+    assert_int_equal(span_compare(header_value, HTTP_HEADER_CONTENT_LENGTH_VALUE), 0);
+    assert_int_equal(http_headers_get_next(&incoming_response.headers, &header_name, &header_value), HL_RESULT_EOF);
 
     assert_int_equal(http_connection_close(&client_connection), ok);
     assert_int_equal(http_connection_close(&server_connection), ok);

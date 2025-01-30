@@ -11,28 +11,67 @@
 
 typedef struct http_request
 {
-    span_t buffer;
     span_t method;
     span_t path;
-    span_t version;
+    span_t http_version;
     http_headers_t headers;
 } http_request_t;
 
-result_t http_request_initialize(http_request_t *request, span_t method, span_t path, span_t version, http_headers_t headers);
+result_t http_request_initialize(http_request_t *request, span_t method, span_t path, span_t http_version, http_headers_t headers);
 
-result_t http_request_get_buffer(http_request_t* request, span_t* buffer);
+result_t http_request_parse(http_request_t* request, span_t raw_request);
 
-result_t http_request_parse(http_request_t* request, span_t buffer);
+static inline result_t http_request_get_method(http_request_t* request, span_t* method)
+{
+    if (request == NULL || method == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *method = request->method;
+        return ok;
+    }
+}
 
-result_t http_request_get_method(http_request_t* request, span_t* method);
+static inline result_t http_request_get_http_version(http_request_t* request, span_t* http_version)
+{
+    if (request == NULL || http_version == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *http_version = request->http_version;
+        return ok;
+    }
+}
 
-result_t http_request_get_http_version(http_request_t* request, span_t* version);
+static inline result_t http_request_get_path(http_request_t* request, span_t* path)
+{
+    if (request == NULL || path == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *path = request->path;
+        return ok;
+    }
+}
 
-result_t http_request_get_path(http_request_t* request, span_t* path);
-
-result_t http_request_get_headers(http_request_t* request, http_headers_t* headers);
-
-result_t http_request_read_body(http_request_t* request, span_t* buffer);
+static inline result_t http_request_get_headers(http_request_t* request, http_headers_t* headers)
+{
+    if (request == NULL || headers == NULL)
+    {
+        return invalid_argument;
+    }
+    else
+    {
+        *headers = request->headers;
+        return ok;
+    }
+}
 
 result_t http_request_serialize_to(http_request_t* request, stream_t* stream);
 

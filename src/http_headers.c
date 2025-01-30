@@ -199,13 +199,16 @@ result_t http_headers_serialize_to(http_headers_t* headers, stream_t* stream)
     {
         result = invalid_argument;
     }
-    else if (failed(stream_write(stream, span_slice(headers->buffer, 0, headers->used_size), NULL)))
+    else 
     {
-        result = error;
-    }
-    else
-    {
-        result = ok;
+        if (headers->used_size == 0)
+        {
+            result = stream_write(stream, crlf, NULL);
+        }
+        else 
+        {
+            result = stream_write(stream, span_slice(headers->buffer, 0, headers->used_size), NULL);
+        }
     }
 
     return result;

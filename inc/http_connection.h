@@ -34,7 +34,7 @@ result_t http_connection_send_response(http_connection_t* connection, http_respo
 
 result_t http_connection_send_request(http_connection_t* connection, http_request_t* request);
 
-result_t http_connection_receive_response(http_connection_t* connection, http_response_t* response);
+result_t http_connection_receive_response(http_connection_t* connection, span_t buffer, http_response_t* response, span_t* out_buffer_remainder);
 
 result_t http_connection_close(http_connection_t* connection);
 

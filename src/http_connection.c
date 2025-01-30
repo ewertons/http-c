@@ -87,7 +87,7 @@ result_t http_connection_send_response(http_connection_t* connection, http_respo
     }
     else
     {
-        result = ok;
+        result = http_response_serialize_to(response, &connection->stream);
     }
 
     return result;
@@ -109,7 +109,7 @@ result_t http_connection_send_request(http_connection_t* connection, http_reques
     return result;
 }
 
-result_t http_connection_receive_response(http_connection_t* connection, http_response_t* response)
+result_t http_connection_receive_response(http_connection_t* connection, span_t buffer, http_response_t* response, span_t* out_buffer_remainder)
 {
     result_t result;
 
@@ -119,7 +119,25 @@ result_t http_connection_receive_response(http_connection_t* connection, http_re
     }
     else
     {
-        result = ok;
+        span_t original_buffer = buffer;
+        span_t bytes_read;
+        
+        while (succeeded(result = stream_read(&connection->stream, buffer, &bytes_read, &buffer)))
+        {
+            bytes_read = span_slice_out(original_buffer, buffer);
+
+            if (span_find_reverse(bytes_read, -1, headers_terminator) != -1)
+            {
+                result = http_response_parse(response, bytes_read, NULL);
+
+                if (out_buffer_remainder != NULL)
+                {
+                    *out_buffer_remainder = buffer;
+                }
+
+                break;
+            }
+        }
     }
 
     return result;

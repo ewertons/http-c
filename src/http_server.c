@@ -31,11 +31,11 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config)
     return result;
 }
 
-result_t http_server_add_route(http_server_t* server, http_method_t method, span_t path, http_request_handler_t handler, void* user_context)
+result_t http_server_add_route(http_server_t* server, span_t method, span_t path, http_request_handler_t handler, void* user_context)
 {
     result_t result;
 
-    if (server == NULL || span_is_empty(path) || handler == NULL)
+    if (server == NULL || span_is_empty(method) || span_is_empty(path) || handler == NULL)
     {
         result = invalid_argument;
     }
@@ -55,32 +55,6 @@ result_t http_server_add_route(http_server_t* server, http_method_t method, span
     }
 
     return result;
-}
-
-static span_t get_method_as_span(http_method_t method)
-{
-    span_t method_as_span;
-
-    switch(method)
-    {
-        case GET:
-            method_as_span = HTTP_METHOD_GET;
-            break;
-        case POST:
-            method_as_span = HTTP_METHOD_POST;
-            break;
-        case PUT:
-            method_as_span = HTTP_METHOD_PUT;
-            break;
-        case DELETE:
-            method_as_span = HTTP_METHOD_DELETE;
-            break;
-        default:
-            method_as_span = SPAN_EMPTY;
-            break;
-    }
-
-    return method_as_span;
 }
 
 result_t http_server_run(http_server_t* server)
@@ -123,9 +97,7 @@ result_t http_server_run(http_server_t* server)
                         {
                             for(int i = 0; i < server->routes.count; i++)
                             {
-                                span_t route_method = get_method_as_span(server->routes.list[i].method);
-
-                                if (span_compare(route_method, request.method) == 0)
+                                if (span_compare(server->routes.list[i].method, request.method) == 0)
                                 {
                                     span_t path_matches[5];
                                     uint16_t number_of_matches;

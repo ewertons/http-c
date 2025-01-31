@@ -154,12 +154,8 @@ result_t http_connection_close(http_connection_t* connection)
     else
     {
         // TODO: add a connection_state flag to know if it is initialized.
-        (void)socket_deinit(&connection->socket);
-
-        memset(&connection->stream, 0, sizeof(stream_t)); // TODO: add a stream_close and call it here.
+        result = stream_close(&connection->stream);
         connection->endpoint = NULL;
-
-        result = ok;
     }
 
     return result;

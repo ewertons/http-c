@@ -9,9 +9,17 @@
 #include "niceties.h"
 
 #include <http_request.h>
+#include <http_response.h>
+#include "http_methods.h"
 #include "http_server.h"
 
 #include <test_http.h>
+
+#define CLIENT_CERT_PATH "TBD"
+#define CLIENT_PK_PATH "TBD"
+#define SERVER_CERT_PATH "TBD"
+#define SERVER_PK_PATH "TBD"
+#define CA_CHAIN_PATH "TBD"
 
 static uint8_t TEST_HTTP_REQUEST_GET_1[] = "GET / HTTP/1.1\r\n\
 Host: localhost:1234\r\n\
@@ -23,6 +31,15 @@ Connection: keep-alive\r\n\
 Upgrade-Insecure-Requests: 1\r\n\
 \r\n";
 
+static void handle_http_request(http_request_t* request, span_t* path_matches, uint16_t number_of_matches, http_response_t* out_response, void* user_context)
+{
+    (void)request;
+    (void)path_matches;
+    (void)number_of_matches;
+    (void)out_response;
+    (void)user_context;
+}
+
 static void http_server_init_succeed(void** state)
 {
     (void)state;
@@ -31,12 +48,13 @@ static void http_server_init_succeed(void** state)
     http_server_config_t http_server_config;
     http_server_config.port = 10000;
     // 1 [GOOD]
-    http_server_init(&http_server, &http_server_config);
+    assert_int_equal(http_server_init(&http_server, &http_server_config), ok);
 
-    // http_server_add_route(&http, POST, "/cars/*/*/*", a);
-    // http_server_add_route(&http, GET, "/index.html", a);
-    // http_server_add_route(&http, GET, "/", a);
+    assert_int_equal(http_server_add_route(&http_server, HTTP_METHOD_POST, span_from_str_literal("/cars/*/*/*"), handle_http_request, NULL), ok);
+    assert_int_equal(http_server_add_route(&http_server, HTTP_METHOD_GET, span_from_str_literal("/index.html"), handle_http_request, NULL), ok);
+    assert_int_equal(http_server_add_route(&http_server, HTTP_METHOD_GET, span_from_str_literal("/"), handle_http_request, NULL), ok);
     // http_server_run(&http_server);
+
     // // 2
     // http_connection_t http_connection;
     // http_connection_start(&http_connection, &http_connection_config);
@@ -66,83 +84,6 @@ static void http_server_init_succeed(void** state)
     
 }
 
-static void http_request_get_GET_succeed2(void** state)
-{
-    (void)state;
-
-    http_request_t request;
-    span_t method;
-    span_t uri;
-    span_t version;
-
-    span_t buffer =  span_from_string(TEST_HTTP_REQUEST_GET_1);
-
-    assert_int_equal(http_request_parse(&request, buffer), HL_RESULT_OK);
-    assert_int_equal(http_request_get_method(&request, &method), HL_RESULT_OK);
-    assert_int_equal(span_compare(method, span_from_str_literal("GET")), 0);
-
-    assert_int_equal(http_request_get_path(&request, &uri), HL_RESULT_OK);
-    assert_int_equal(span_compare(uri, span_from_str_literal("/")), 0);
-
-    assert_int_equal(http_request_get_http_version(&request, &version), HL_RESULT_OK);
-    assert_int_equal(span_compare(version, span_from_str_literal("1.1")), 0);
-}
-
-static void http_request_get_GET_headers_succeed2(void** state)
-{
-    (void)state;
-
-    http_request_t request;
-    http_headers_t headers;
-    span_t name, value;
-
-    span_t buffer =  span_from_string(TEST_HTTP_REQUEST_GET_1);
-
-    assert_int_equal(http_request_parse(&request, buffer), HL_RESULT_OK);
-
-    assert_int_equal(http_request_get_headers(&request, &headers), HL_RESULT_OK);
-
-    for (int i = 0; i < 7; i++)
-    {
-      assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_OK);
-
-      switch(i)
-      {
-        case 0:
-          assert_int_equal(span_compare(name, span_from_str_literal("Host")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("localhost:1234")), 0);
-          break;
-        case 1:
-          assert_int_equal(span_compare(name, span_from_str_literal("User-Agent")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:75.0) Gecko/20100101 Firefox/75.0")), 0);
-          break;
-        case 2:
-          assert_int_equal(span_compare(name, span_from_str_literal("Accept")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")), 0);
-          break;
-        case 3:
-          assert_int_equal(span_compare(name, span_from_str_literal("Accept-Language")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("en-US,en;q=0.5")), 0);
-          break;
-        case 4:
-          assert_int_equal(span_compare(name, span_from_str_literal("Accept-Encoding")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("gzip, deflate, br")), 0);
-          break;
-        case 5:
-          assert_int_equal(span_compare(name, span_from_str_literal("Connection")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("keep-alive")), 0);
-          break;
-        case 6:
-          assert_int_equal(span_compare(name, span_from_str_literal("Upgrade-Insecure-Requests")), 0);
-          assert_int_equal(span_compare(value, span_from_str_literal("1")), 0);
-          break;
-        default:
-          break;
-      }
-    }
-
-    assert_int_equal(http_headers_get_next(&headers, &name, &value), HL_RESULT_EOF);
-}
 
 int test_http_server()
 {

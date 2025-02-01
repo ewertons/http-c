@@ -1,7 +1,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "span.h"
+#include "common_lib_c.h"
+
 #include "http_server.h"
 #include "http_methods.h"
 #include "http_endpoint.h"
@@ -24,6 +25,7 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config)
         local_endpoint_config->tls.enable = config->tls.enable;
         local_endpoint_config->tls.certificate_file = config->tls.certificate_file;
         local_endpoint_config->tls.private_key_file = config->tls.private_key_file;
+        server->state = http_server_state_initialized;
 
         result = ok;
     }
@@ -65,9 +67,15 @@ result_t http_server_run(http_server_t* server)
     {
         result = invalid_argument;
     }
+    else if (server->state == http_server_state_running)
+    {
+        result = error;
+    }
     else
     {
-        while (true) // service
+        server->state = http_server_state_running;
+
+        while (server->state == http_server_state_running) // service
         {
             if (is_error(http_endpoint_init(&server->local_endpoint, &(server->local_endpoint_config))))
             {
@@ -145,26 +153,28 @@ result_t http_server_run(http_server_t* server)
     return result;
 }
 
+static result_t internal_http_server_run_async(void* user_args, task_t* my_task)
+{
+    http_server_t* server = (http_server_t*)user_args;
+    (void)my_task;
 
-// result_t http_server_run(http_server_t* server)
-// {
-//     result_t result = ok;
+    return http_server_run(server);
+}
 
-//     socket_t client_socket;
-//     socket_accept(&server->socket, &client_socket);
+static void on_http_server_run_cancelled(void* user_args)
+{
+    http_server_t* server = (http_server_t*)user_args;
+    server->state == http_server_state_stopped;
+}
 
-//     uint8_t buffer_raw[1024];
-//     span_t buffer = span_from_memory(buffer_raw);
-//     span_t bytes_read;
-
-//     while (true)
-//     {
-//         socket_read(&client_socket, buffer, &bytes_read);
-
-//         printf("Bytes read: %.*s\n", span_get_size(bytes_read), span_get_ptr(bytes_read));
-
-//         socket_write(&client_socket, bytes_read);
-//     }
-
-//     return result;
-// }
+task_t* http_server_run_async(http_server_t* server)
+{
+    if (server == NULL)
+    {
+        return NULL;
+    }
+    else
+    {
+        return task_run(internal_http_server_run_async, on_http_server_run_cancelled, server);
+    }
+}

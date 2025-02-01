@@ -16,11 +16,11 @@
 
 #include <test_http.h>
 
-#define CLIENT_CERT_PATH "/home/ewertons/code/s1/http_listener/tests/scripts/certs/client.cert.pem"
-#define CLIENT_PK_PATH "/home/ewertons/code/s1/http_listener/tests/scripts/private/client.key.pem"
-#define SERVER_CERT_PATH "/home/ewertons/code/s1/http_listener/tests/scripts/certs/server.cert.pem"
-#define SERVER_PK_PATH "/home/ewertons/code/s1/http_listener/tests/scripts/private/server.key.pem"
-#define CA_CHAIN_PATH "/home/ewertons/code/s1/http_listener/tests/scripts/certs/chain.ca.cert.pem"
+#define CLIENT_CERT_PATH "TBD"
+#define CLIENT_PK_PATH "TBD"
+#define SERVER_CERT_PATH "TBD"
+#define SERVER_PK_PATH "TBD"
+#define CA_CHAIN_PATH "TBD"
 
 static uint8_t TEST_HTTP_REQUEST_GET_1[] = "GET / HTTP/1.1\r\n\
 Host: localhost:1234\r\n\

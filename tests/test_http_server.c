@@ -40,55 +40,34 @@ static void handle_http_request(http_request_t* request, span_t* path_matches, u
     (void)user_context;
 }
 
-static void http_server_init_succeed(void** state)
+static void http_server_run_succeed(void** state)
 {
     (void)state;
     http_server_t http_server;
 
-    http_server_config_t http_server_config;
-    http_server_config.port = 10000;
-    // 1 [GOOD]
+    http_server_config_t http_server_config = http_server_get_default_config();
+    http_server_config.tls.certificate_file = SERVER_CERT_PATH;
+    http_server_config.tls.private_key_file = SERVER_PK_PATH;
+
     assert_int_equal(http_server_init(&http_server, &http_server_config), ok);
 
     assert_int_equal(http_server_add_route(&http_server, HTTP_METHOD_POST, span_from_str_literal("/cars/*/*/*"), handle_http_request, NULL), ok);
     assert_int_equal(http_server_add_route(&http_server, HTTP_METHOD_GET, span_from_str_literal("/index.html"), handle_http_request, NULL), ok);
     assert_int_equal(http_server_add_route(&http_server, HTTP_METHOD_GET, span_from_str_literal("/"), handle_http_request, NULL), ok);
-    // http_server_run(&http_server);
 
-    // // 2
-    // http_connection_t http_connection;
-    // http_connection_start(&http_connection, &http_connection_config);
-    // http_connection_send_request(&http_connection, &http_request);
-    // http_connection_receive_response(&http_connection, &http_response);
-
-    // http_connection_t http_connection;
-    // http_connection_listen(&http_connection, &http_connection_config);
-    // http_connection_receive_request(&http_connection, &http_response);
-    // http_connection_send_response(&http_connection, &http_request);
-    // // 3
-    // http_t http;
-    // http_connect(&http, &http_config);
-    // http_send_request(&http, &http_request);
-    // http_receive_response(&http, &http_response);
-
-    // http_t http;
-    // http_listen(&http, &http_config, &http_client);
-    // http_receive_request(&http_client, &http_response);
-    // http_send_response(&http_client, &http_request);
-
-    // http_run_server();
-
-    // 4
+    task_t* http_server_task = http_server_run_async(&http_server);
+    assert_non_null(http_server_task);
 
 
-    
+    task_cancel(http_server_task);
+    assert_true(task_wait(http_server_task));
 }
 
 
 int test_http_server()
 {
   const struct CMUnitTest tests[] = {
-    cmocka_unit_test(http_server_init_succeed)
+    cmocka_unit_test(http_server_run_succeed)
   };
 
   return cmocka_run_group_tests_name("http_server", tests, NULL, NULL);

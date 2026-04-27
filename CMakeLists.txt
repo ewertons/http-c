@@ -9,6 +9,7 @@ set(
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/http_headers.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_request.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/http_request_parser.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_response.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_endpoint.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_connection.c

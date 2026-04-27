@@ -15,6 +15,7 @@ add_executable(${TARGET_NAME}
                 main.c
                 test_http_headers.c
                 test_http_request.c
+                test_http_request_parser.c
                 test_http_response.c
                 test_http_server.c
                 test_http_endpoint.c

@@ -2,6 +2,7 @@
 #define TEST_HTTPS_LISTENER_H
 
 int test_http_request();
+int test_http_request_parser();
 int test_http_headers();
 int test_http_response();
 int test_http_server();

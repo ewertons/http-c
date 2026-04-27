@@ -1,1 +1,5 @@
 build/
+build-bench/
+benchmarks/external/
+benchmarks/results/
+benchmarks/certs/

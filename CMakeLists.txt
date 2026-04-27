@@ -26,3 +26,8 @@ add_library(http ${SOURCES})
 
 add_subdirectory(samples)
 add_subdirectory(tests)
+
+option(HTTP_C_BUILD_BENCHMARKS "Build benchmark executables" OFF)
+if(HTTP_C_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()

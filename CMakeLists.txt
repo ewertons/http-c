@@ -14,6 +14,8 @@ set(
     ${CMAKE_CURRENT_LIST_DIR}/src/http_endpoint.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_connection.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_server.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/http_server_storage_for_server_host.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/http_server_storage_for_microcontroller.c
 )
 
 include_directories(

@@ -10,6 +10,7 @@
 #include "http_versions.h"
 #include "http_headers.h"
 #include "http_server.h"
+#include "http_server_storage.h"
 #include "task.h"
 
 #define SERVER_CERT_PATH "/tmp/http-c-certs/server/server.cert.pem"
@@ -50,7 +51,7 @@ int main(int argc, char** argv)
 
     http_server_t http_server;
 
-    http_server_init(&http_server, &http_server_config);
+    http_server_init(&http_server, &http_server_config, http_server_storage_get_for_server_host());
     http_server_add_route(&http_server, HTTP_METHOD_POST, span_from_str_literal("^/cars/.*/.*/.*$"), a, NULL);
     http_server_add_route(&http_server, HTTP_METHOD_GET,  span_from_str_literal("^/index\\.html$"),   a, NULL);
     http_server_add_route(&http_server, HTTP_METHOD_GET,  span_from_str_literal("^/$"),               a, NULL);

@@ -46,14 +46,14 @@ static http_server_connection_slot_t* acquire_slot(http_server_t* server)
     (void)pthread_mutex_lock(&server->state_mutex);
 
     http_server_connection_slot_t* slot = NULL;
-    for (int i = 0; i < HTTP_SERVER_MAX_CONNECTIONS; i++)
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
     {
-        if (!server->slots[i].in_use)
+        if (!server->storage->slots[i].in_use)
         {
-            server->slots[i].in_use = true;
-            server->slots[i].server = server;
-            server->slots[i].task   = NULL;
-            slot = &server->slots[i];
+            server->storage->slots[i].in_use = true;
+            server->storage->slots[i].server = server;
+            server->storage->slots[i].task   = NULL;
+            slot = &server->storage->slots[i];
             break;
         }
     }
@@ -113,7 +113,7 @@ static result_t connection_worker(void* state, task_t* self)
     http_server_t*                 server = slot->server;
     http_connection_t*             conn   = &slot->connection;
 
-    span_t buffer = span_init(slot->buffer, sizeof(slot->buffer));
+    span_t buffer = span_init(slot->buffer_ptr, slot->buffer_size);
 
     bool keep_alive = true;
     while (keep_alive && !task_is_cancellation_requested(self) &&
@@ -136,9 +136,9 @@ static result_t connection_worker(void* state, task_t* self)
         bool method_matched = false;
         bool route_matched  = false;
 
-        for (uint16_t i = 0; i < server->routes.count; i++)
+        for (uint32_t i = 0; i < server->route_count; i++)
         {
-            if (span_compare(server->routes.list[i].method, request.method) != 0)
+            if (span_compare(server->storage->routes[i].method, request.method) != 0)
             {
                 continue;
             }
@@ -147,7 +147,7 @@ static result_t connection_worker(void* state, task_t* self)
             span_t   path_matches[5];
             uint16_t number_of_matches = 0;
 
-            result_t mr = span_regex_match(&server->routes.list[i].compiled_path,
+            result_t mr = span_regex_match(&server->storage->routes[i].compiled_path,
                                            request.path,
                                            path_matches,
                                            (uint16_t)sizeofarray(path_matches),
@@ -157,8 +157,8 @@ static result_t connection_worker(void* state, task_t* self)
             {
                 /* Pre-fill a 200 OK; handler may override. */
                 prepare_default_response(&response, HTTP_CODE_200, HTTP_REASON_PHRASE_200);
-                server->routes.list[i].handler(&request, path_matches, number_of_matches,
-                                               &response, server->routes.list[i].user_context);
+                server->storage->routes[i].handler(&request, path_matches, number_of_matches,
+                                                   &response, server->storage->routes[i].user_context);
                 route_matched = true;
                 break;
             }
@@ -168,7 +168,7 @@ static result_t connection_worker(void* state, task_t* self)
         {
             prepare_default_response(&response, HTTP_CODE_404, HTTP_REASON_PHRASE_404);
         }
-        else if (!method_matched && server->routes.count > 0)
+        else if (!method_matched && server->route_count > 0)
         {
             prepare_default_response(&response, HTTP_CODE_405, HTTP_REASON_PHRASE_405);
         }
@@ -193,9 +193,11 @@ static result_t connection_worker(void* state, task_t* self)
 /* ------------------------------------------------------------------------- *
  * Public API.
  * ------------------------------------------------------------------------- */
-result_t http_server_init(http_server_t* server, http_server_config_t* config)
+result_t http_server_init(http_server_t* server, http_server_config_t* config, http_server_storage_t* storage)
 {
-    if (server == NULL || config == NULL)
+    if (server == NULL || config == NULL || storage == NULL ||
+        storage->slots == NULL || storage->routes == NULL ||
+        storage->slot_count == 0 || storage->route_count == 0)
     {
         return invalid_argument;
     }
@@ -205,6 +207,23 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config)
     if (pthread_mutex_init(&server->state_mutex, NULL) != 0)
     {
         return error;
+    }
+
+    server->storage     = storage;
+    server->route_count = 0;
+
+    /* Reset slot in-use flags so a storage instance can be reused across
+     * server lifecycles. Buffer pointers were wired up by the storage
+     * provider; we must not clobber them. */
+    for (uint32_t i = 0; i < storage->slot_count; i++)
+    {
+        storage->slots[i].in_use = false;
+        storage->slots[i].server = NULL;
+        storage->slots[i].task   = NULL;
+    }
+    for (uint32_t i = 0; i < storage->route_count; i++)
+    {
+        storage->routes[i].in_use = false;
     }
 
     http_endpoint_config_t* lc = &server->local_endpoint_config;
@@ -226,11 +245,15 @@ result_t http_server_deinit(http_server_t* server)
         return invalid_argument;
     }
 
-    for (uint16_t i = 0; i < server->routes.count; i++)
+    if (server->storage != NULL)
     {
-        span_regex_free(&server->routes.list[i].compiled_path);
+        for (uint32_t i = 0; i < server->route_count; i++)
+        {
+            span_regex_free(&server->storage->routes[i].compiled_path);
+            server->storage->routes[i].in_use = false;
+        }
     }
-    server->routes.count = 0;
+    server->route_count = 0;
 
     (void)pthread_mutex_destroy(&server->state_mutex);
     return ok;
@@ -243,16 +266,17 @@ result_t http_server_add_route(http_server_t* server, span_t method, span_t path
         return invalid_argument;
     }
 
-    if (server->routes.count == HTTP_SERVER_MAX_ROUTES)
+    if (server->route_count == server->storage->route_count)
     {
         return insufficient_size;
     }
 
-    http_route_t* route = &server->routes.list[server->routes.count];
+    http_route_t* route = &server->storage->routes[server->route_count];
     route->method       = method;
     route->path         = path;
     route->handler      = handler;
     route->user_context = user_context;
+    route->in_use       = true;
 
     /* Pre-compile the path pattern once; reused for every incoming request. */
     if (span_regex_compile(&route->compiled_path, path) != ok)
@@ -260,7 +284,7 @@ result_t http_server_add_route(http_server_t* server, span_t method, span_t path
         return error;
     }
 
-    server->routes.count++;
+    server->route_count++;
     return ok;
 }
 
@@ -378,18 +402,18 @@ result_t http_server_run(http_server_t* server)
     }
 
     /* Drain in-flight workers. */
-    for (int i = 0; i < HTTP_SERVER_MAX_CONNECTIONS; i++)
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
     {
         bool busy;
         (void)pthread_mutex_lock(&server->state_mutex);
-        busy = server->slots[i].in_use;
+        busy = server->storage->slots[i].in_use;
         (void)pthread_mutex_unlock(&server->state_mutex);
 
         while (busy)
         {
             task_sleep_ms(10);
             (void)pthread_mutex_lock(&server->state_mutex);
-            busy = server->slots[i].in_use;
+            busy = server->storage->slots[i].in_use;
             (void)pthread_mutex_unlock(&server->state_mutex);
         }
     }

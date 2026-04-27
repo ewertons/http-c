@@ -21,6 +21,7 @@
 #include "http_endpoint.h"
 #include "http_connection.h"
 #include "http_server.h"
+#include "http_server_storage.h"
 
 #include <test_http.h>
 
@@ -221,14 +222,22 @@ static void http_server_init_NULL_server_fails(void** state)
 {
     (void)state;
     http_server_config_t cfg = http_server_get_default_config();
-    assert_int_equal(http_server_init(NULL, &cfg), invalid_argument);
+    assert_int_equal(http_server_init(NULL, &cfg, http_server_storage_get_for_server_host()), invalid_argument);
 }
 
 static void http_server_init_NULL_config_fails(void** state)
 {
     (void)state;
     http_server_t server;
-    assert_int_equal(http_server_init(&server, NULL), invalid_argument);
+    assert_int_equal(http_server_init(&server, NULL, http_server_storage_get_for_server_host()), invalid_argument);
+}
+
+static void http_server_init_NULL_storage_fails(void** state)
+{
+    (void)state;
+    http_server_t server;
+    http_server_config_t cfg = http_server_get_default_config();
+    assert_int_equal(http_server_init(&server, &cfg, NULL), invalid_argument);
 }
 
 static void http_server_deinit_NULL_fails(void** state)
@@ -251,7 +260,7 @@ static void http_server_add_route_empty_method_fails(void** state)
     (void)state;
     http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
     assert_int_equal(http_server_add_route(&server, SPAN_EMPTY,
                                            span_from_str_literal("^/$"),
@@ -266,7 +275,7 @@ static void http_server_add_route_empty_path_fails(void** state)
     (void)state;
     http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET, SPAN_EMPTY,
                                            noop_handler, NULL),
@@ -280,7 +289,7 @@ static void http_server_add_route_NULL_handler_fails(void** state)
     (void)state;
     http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/$"),
@@ -295,9 +304,9 @@ static void http_server_add_route_overflow_fails(void** state)
     (void)state;
     http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
-    for (int i = 0; i < HTTP_SERVER_MAX_ROUTES; i++)
+    for (uint32_t i = 0; i < server.storage->route_count; i++)
     {
         assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                                span_from_str_literal("^/$"),
@@ -336,7 +345,7 @@ static void http_server_init_and_deinit_succeed(void** state)
     http_server_config_t cfg = http_server_get_default_config();
     cfg.tls.certificate_file = SERVER_CERT_PATH;
     cfg.tls.private_key_file = SERVER_PK_PATH;
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_deinit(&server), ok);
 }
 
@@ -345,7 +354,7 @@ static void http_server_add_multiple_routes_succeed(void** state)
     (void)state;
     http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/$"),
@@ -370,7 +379,7 @@ static void http_server_run_lifecycle_succeed(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_RUN_LIFECYCLE);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/$"),
                                            noop_handler, NULL), ok);
@@ -400,7 +409,7 @@ static void http_server_handles_GET_request_succeed(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_HANDLE_GET);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
@@ -451,7 +460,7 @@ static void http_server_handles_POST_with_body_succeed(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_HANDLE_POST);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_POST,
                                            span_from_str_literal("^/api/items$"),
                                            capturing_handler, &handler), ok);
@@ -501,7 +510,7 @@ static void http_server_path_captures_succeed(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_PATH_CAPTURES);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/cars/([^/]+)/([^/]+)$"),
                                            capturing_handler, &handler), ok);
@@ -549,7 +558,7 @@ static void http_server_returns_404_for_unknown_path(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_NOT_FOUND);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/exists$"),
                                            capturing_handler, &handler), ok);
@@ -592,7 +601,7 @@ static void http_server_returns_405_for_method_mismatch(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_METHOD_MISMATCH);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     /* Only register POST; client will GET. */
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_POST,
                                            span_from_str_literal("^/$"),
@@ -637,7 +646,7 @@ static void http_server_keep_alive_multiple_requests_succeed(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_KEEP_ALIVE);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
@@ -693,7 +702,7 @@ static void http_server_handles_parallel_clients_succeed(void** state)
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_PARALLEL);
 
-    assert_int_equal(http_server_init(&server, &cfg), ok);
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
@@ -755,6 +764,7 @@ int test_http_server()
         /* Negative */
         cmocka_unit_test(http_server_init_NULL_server_fails),
         cmocka_unit_test(http_server_init_NULL_config_fails),
+        cmocka_unit_test(http_server_init_NULL_storage_fails),
         cmocka_unit_test(http_server_deinit_NULL_fails),
         cmocka_unit_test(http_server_add_route_NULL_server_fails),
         cmocka_unit_test(http_server_add_route_empty_method_fails),

@@ -1,9 +1,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 
 #include "common_lib_c.h"
 
@@ -15,6 +17,8 @@
 #include "http_versions.h"
 #include "http_headers.h"
 #include "common.h"
+#include "socket_stream.h"
+#include "event_loop.h"
 
 /* ------------------------------------------------------------------------- *
  * Internal helpers.
@@ -69,6 +73,16 @@ static void release_slot(http_server_connection_slot_t* slot)
     slot->in_use = false;
     slot->task   = NULL;
     (void)pthread_mutex_unlock(&server->state_mutex);
+
+    /* Notify the accept loop that a slot has freed up. The accept callback
+     * may have deregistered the listen fd if all slots were busy; this
+     * eventfd write wakes the loop so it can re-arm the listener. */
+    if (server->slot_freed_fd != -1)
+    {
+        uint64_t v = 1;
+        ssize_t  n = write(server->slot_freed_fd, &v, sizeof(v));
+        (void)n;
+    }
 }
 
 /* ------------------------------------------------------------------------- *
@@ -295,9 +309,9 @@ result_t http_server_stop(http_server_t* server)
         return invalid_argument;
     }
 
-    /* Wait for the server to either be running or already stopped before
-     * attempting to interrupt - otherwise stop may race with a still-pending
-     * http_server_run that hasn't initialized the listening socket yet. */
+    /* Wait for the run loop to be either running or already stopped before
+     * attempting to interrupt it - otherwise stop may race with a still
+     * pending http_server_run that hasn't initialised the event loop yet. */
     for (int i = 0; i < 1000; i++)
     {
         http_server_state_t s = server_get_state(server);
@@ -310,28 +324,96 @@ result_t http_server_stop(http_server_t* server)
 
     server_set_state(server, http_server_state_stopping);
 
-    /* Wake up any blocked accept() in the run loop. shutdown(SHUT_RDWR) is
-     * not reliable on Linux for waking blocked accept calls, so we also
-     * make a throwaway TCP connection to ourselves: accept() will return,
-     * the run loop will observe the stopping state and break out. */
-    int fd = server->local_endpoint.socket.listen_sd;
-    if (fd != -1)
-    {
-        (void)shutdown(fd, SHUT_RDWR);
+    /* Wake the event loop. event_loop_stop is safe from any thread. */
+    (void)event_loop_stop(&server->loop);
+    return ok;
+}
 
-        int wake = socket(AF_INET, SOCK_STREAM, 0);
-        if (wake != -1)
+/* ------------------------------------------------------------------------- *
+ * event_loop callbacks (run on the loop thread).
+ * ------------------------------------------------------------------------- */
+
+static void on_listen_readable(int fd, uint32_t events, void* user);
+
+static void on_slot_freed(int fd, uint32_t events, void* user)
+{
+    (void)events;
+    http_server_t* server = (http_server_t*)user;
+
+    /* Drain the eventfd. */
+    uint64_t v;
+    ssize_t  n;
+    do { n = read(fd, &v, sizeof(v)); } while (n == -1 && errno == EINTR);
+    (void)n;
+
+    if (server_get_state(server) != http_server_state_running)
+    {
+        return;
+    }
+
+    if (!server->listen_registered)
+    {
+        int listen_sd = server->local_endpoint.socket.listen_sd;
+        if (listen_sd != -1 &&
+            event_loop_register(&server->loop, listen_sd,
+                                event_loop_event_read,
+                                on_listen_readable, server) == ok)
         {
-            struct sockaddr_in sa;
-            (void)memset(&sa, 0, sizeof(sa));
-            sa.sin_family      = AF_INET;
-            sa.sin_port        = htons(server->local_endpoint_config.local.port);
-            sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            (void)connect(wake, (struct sockaddr*)&sa, sizeof(sa));
-            (void)close(wake);
+            server->listen_registered = true;
         }
     }
-    return ok;
+}
+
+static void on_listen_readable(int fd, uint32_t events, void* user)
+{
+    (void)events;
+    http_server_t* server = (http_server_t*)user;
+
+    if (server_get_state(server) != http_server_state_running)
+    {
+        return;
+    }
+
+    http_server_connection_slot_t* slot = acquire_slot(server);
+    if (slot == NULL)
+    {
+        /* All slots busy. Stop listening for new connections until a slot
+         * frees; the on_slot_freed callback will re-arm us. */
+        (void)event_loop_unregister(&server->loop, fd);
+        server->listen_registered = false;
+        return;
+    }
+
+    (void)memset(&slot->connection, 0, sizeof(slot->connection));
+
+    /* The listen fd just became readable so accept() will not block. The
+     * accepted fd inherits the blocking mode of the listen fd, so the
+     * existing blocking-I/O connection_worker keeps working. */
+    if (is_error(socket_accept(&server->local_endpoint.socket,
+                               &slot->connection.socket)))
+    {
+        release_slot(slot);
+        return;
+    }
+
+    if (is_error(socket_stream_initialize(&slot->connection.stream,
+                                          &slot->connection.socket)))
+    {
+        (void)http_connection_close(&slot->connection);
+        release_slot(slot);
+        return;
+    }
+    slot->connection.endpoint = &server->local_endpoint;
+
+    slot->task = task_run(connection_worker, slot);
+    if (slot->task == NULL)
+    {
+        (void)http_connection_close(&slot->connection);
+        release_slot(slot);
+        return;
+    }
+    /* Fire and forget. The worker holds its own reference. */
+    task_release(slot->task);
 }
 
 result_t http_server_run(http_server_t* server)
@@ -353,8 +435,48 @@ result_t http_server_run(http_server_t* server)
         return error;
     }
 
-    /* Atomically promote initialized → running. If a concurrent stop has
-     * already moved us into stopping/stopped, drop into the drain path. */
+    if (is_error(event_loop_init(&server->loop)))
+    {
+        (void)http_endpoint_deinit(&server->local_endpoint);
+        return error;
+    }
+
+    server->slot_freed_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (server->slot_freed_fd == -1)
+    {
+        (void)event_loop_deinit(&server->loop);
+        (void)http_endpoint_deinit(&server->local_endpoint);
+        return error;
+    }
+
+    if (event_loop_register(&server->loop, server->slot_freed_fd,
+                            event_loop_event_read,
+                            on_slot_freed, server) != ok)
+    {
+        close(server->slot_freed_fd);
+        server->slot_freed_fd = -1;
+        (void)event_loop_deinit(&server->loop);
+        (void)http_endpoint_deinit(&server->local_endpoint);
+        return error;
+    }
+
+    int listen_sd = server->local_endpoint.socket.listen_sd;
+    if (event_loop_register(&server->loop, listen_sd,
+                            event_loop_event_read,
+                            on_listen_readable, server) != ok)
+    {
+        (void)event_loop_unregister(&server->loop, server->slot_freed_fd);
+        close(server->slot_freed_fd);
+        server->slot_freed_fd = -1;
+        (void)event_loop_deinit(&server->loop);
+        (void)http_endpoint_deinit(&server->local_endpoint);
+        return error;
+    }
+    server->listen_registered = true;
+
+    /* Atomically promote initialised → running. If a concurrent stop has
+     * already moved us into stopping/stopped, the loop will exit on first
+     * iteration. */
     (void)pthread_mutex_lock(&server->state_mutex);
     if (server->state == http_server_state_initialized)
     {
@@ -362,44 +484,19 @@ result_t http_server_run(http_server_t* server)
     }
     (void)pthread_mutex_unlock(&server->state_mutex);
 
-    result_t result = ok;
+    /* Run until http_server_stop is invoked from another thread. */
+    result_t result = event_loop_run(&server->loop);
 
-    while (server_get_state(server) == http_server_state_running)
+    /* Tear down event loop registrations. */
+    if (server->listen_registered)
     {
-        http_server_connection_slot_t* slot = acquire_slot(server);
-
-        if (slot == NULL)
-        {
-            /* All worker slots busy. Back off briefly. */
-            task_sleep_ms(5);
-            continue;
-        }
-
-        result_t cr = http_endpoint_wait_for_connection(&server->local_endpoint, &slot->connection);
-
-        if (is_error(cr))
-        {
-            release_slot(slot);
-            if (server_get_state(server) != http_server_state_running)
-            {
-                break;
-            }
-            /* Transient accept failure - keep looping. */
-            continue;
-        }
-
-        slot->task = task_run(connection_worker, slot);
-        if (slot->task == NULL)
-        {
-            /* Could not spawn a worker - close and continue. */
-            (void)http_connection_close(&slot->connection);
-            release_slot(slot);
-            continue;
-        }
-        /* Fire and forget. The worker holds its own reference and we
-         * release the caller's. */
-        task_release(slot->task);
+        (void)event_loop_unregister(&server->loop, listen_sd);
+        server->listen_registered = false;
     }
+    (void)event_loop_unregister(&server->loop, server->slot_freed_fd);
+    close(server->slot_freed_fd);
+    server->slot_freed_fd = -1;
+    (void)event_loop_deinit(&server->loop);
 
     /* Drain in-flight workers. */
     for (uint32_t i = 0; i < server->storage->slot_count; i++)

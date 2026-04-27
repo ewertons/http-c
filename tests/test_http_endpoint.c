@@ -16,11 +16,11 @@
 
 #include <test_http.h>
 
-#define CLIENT_CERT_PATH "TBD"
-#define CLIENT_PK_PATH "TBD"
-#define SERVER_CERT_PATH "TBD"
-#define SERVER_PK_PATH "TBD"
-#define CA_CHAIN_PATH "TBD"
+#define CLIENT_CERT_PATH "/tmp/http-c-certs/client/client.cert.pem"
+#define CLIENT_PK_PATH "/tmp/http-c-certs/client/client.key.pem"
+#define SERVER_CERT_PATH "/tmp/http-c-certs/server/server.cert.pem"
+#define SERVER_PK_PATH "/tmp/http-c-certs/server/server.key.pem"
+#define CA_CHAIN_PATH "/tmp/http-c-certs/ca/chain.ca.cert.pem"
 
 static uint8_t TEST_HTTP_REQUEST_GET_1[] = "GET / HTTP/1.1\r\n\
 Host: localhost:1234\r\n\
@@ -46,6 +46,7 @@ static span_t HTTP_HEADER_CONNECTION_VALUE = span_from_str_literal("keep-alive")
 static span_t HTTP_HEADER_SERVER_VALUE = span_from_str_literal("http-c");
 static span_t HTTP_HEADER_CONTENT_TYPE_VALUE = span_from_str_literal("text/html; charset=UTF-8");
 static span_t HTTP_HEADER_CONTENT_LENGTH_VALUE = span_from_str_literal("43");
+static span_t HTTP_RESPONSE_BODY = span_from_str_literal("<html><body>Hello from http-c</body></html>");
 
 static void http_endpoint_init_listener_succeed(void** state)
 {
@@ -86,7 +87,9 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(http_endpoint_connect(&client_endpoint, &client_connection), ok);
 
     assert_true(task_wait(wait_for_connection_task));
-    // assert_int_equal(, completed_successfully);
+    assert_true(task_is_completed(wait_for_connection_task));
+    assert_int_equal(task_get_result(wait_for_connection_task), ok);
+    task_release(wait_for_connection_task);
 
     span_t test_buffer = span_from_memory(test_raw_buffer);
 
@@ -125,6 +128,7 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(http_headers_add(&outgoing_response_headers, HTTP_HEADER_CONTENT_TYPE, HTTP_HEADER_CONTENT_TYPE_VALUE), HL_RESULT_OK);
     assert_int_equal(http_headers_add(&outgoing_response_headers, HTTP_HEADER_CONTENT_LENGTH, HTTP_HEADER_CONTENT_LENGTH_VALUE), HL_RESULT_OK);
     assert_int_equal(http_response_initialize(&outgoing_response, HTTP_VERSION_1_1, HTTP_CODE_200, HTTP_REASON_PHRASE_200, outgoing_response_headers), ok);
+    outgoing_response.body = HTTP_RESPONSE_BODY;
     assert_int_equal(http_connection_send_response(&server_connection, &outgoing_response), ok);
 
     assert_int_equal(http_connection_receive_response(&client_connection, test_buffer, &incoming_response, NULL), ok);

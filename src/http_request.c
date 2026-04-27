@@ -23,6 +23,7 @@ result_t http_request_initialize(http_request_t *request, span_t method, span_t 
         request->path = path;
         request->http_version = http_version;
         request->headers = headers;
+        request->body = SPAN_EMPTY;
 
         result = ok;
     }
@@ -41,6 +42,8 @@ result_t http_request_parse(http_request_t *request, span_t raw_request)
     }
     else
     {
+        request->body = SPAN_EMPTY;
+
         if (span_split(raw_request, 0, space, &request->method, &raw_request) != 0)
         {
             result = error;
@@ -55,7 +58,17 @@ result_t http_request_parse(http_request_t *request, span_t raw_request)
         }
         else
         {
-            result = http_headers_parse(&request->headers, raw_request);
+            /* Split headers and body at the CRLFCRLF boundary if present. */
+            span_t headers_part = raw_request;
+            span_t body_part = SPAN_EMPTY;
+            int term = span_find(raw_request, 0, headers_terminator, &body_part);
+            if (term != -1)
+            {
+                headers_part = span_slice(raw_request, 0, (uint32_t)term + (uint32_t)span_get_size(crlf));
+                request->body = body_part;
+            }
+
+            result = http_headers_parse(&request->headers, headers_part);
         }
     }
 
@@ -72,8 +85,6 @@ result_t http_request_serialize_to(http_request_t* request, stream_t* stream)
     }
     else
     {
-        span_t raw_headers;
-
         if (failed(stream_write(stream, request->method, NULL)))
         {
             result = error;
@@ -102,8 +113,13 @@ result_t http_request_serialize_to(http_request_t* request, stream_t* stream)
         {
             result = error;
         }
-        // One crlf is already sent by http_headers_serialize_to.
+        /* End of header block. */
         else if (failed(stream_write(stream, crlf, NULL)))
+        {
+            result = error;
+        }
+        else if (!span_is_empty(request->body) &&
+                 failed(stream_write(stream, request->body, NULL)))
         {
             result = error;
         }

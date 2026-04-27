@@ -57,7 +57,8 @@ result_t http_endpoint_wait_for_connection(http_endpoint_t* endpoint, http_conne
     {
         (void)memset(connection, 0, sizeof(http_connection_t));
 
-        if (is_success(result = socket_accept(&endpoint->socket, &connection->socket)))
+        result = socket_accept(&endpoint->socket, &connection->socket);
+        if (is_success(result))
         {
              result = socket_stream_initialize(&connection->stream, &connection->socket);
         }
@@ -96,7 +97,7 @@ task_t* http_endpoint_wait_for_connection_async(http_endpoint_t* endpoint, http_
     else
     {
         // TODO: pass a cancellation handler.
-        return task_run(internal_wait_for_connection_async, NULL, connection);
+        return task_run(internal_wait_for_connection_async, connection);
     }
 }
 
@@ -116,7 +117,8 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
         
         if (is_success(result))
         {
-            if (is_success(result = socket_connect(&connection->socket)))
+            result = socket_connect(&connection->socket);
+            if (is_success(result))
             {
                 result = socket_stream_initialize(&connection->stream, &connection->socket);
             }

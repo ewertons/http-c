@@ -37,9 +37,36 @@ result_t http_headers_parse(http_headers_t* headers, span_t raw_headers)
     }
     else
     {
+        /* Trim at the headers terminator (CRLF CRLF) so the body, if any,
+         * is not treated as part of the header block. If the terminator is
+         * absent, fall back to the full buffer (caller must have ensured
+         * the buffer ends at the boundary already). */
+        int term_pos = span_find_reverse(raw_headers, -1, headers_terminator);
+        uint32_t headers_size;
+
+        if (term_pos == -1)
+        {
+            /* Try CRLF at the end. */
+            int single = span_find_reverse(raw_headers, -1, crlf);
+            if (single == -1)
+            {
+                headers_size = span_get_size(raw_headers);
+            }
+            else
+            {
+                headers_size = (uint32_t)single + (uint32_t)span_get_size(crlf);
+            }
+        }
+        else
+        {
+            /* Include the trailing CRLF that closes the last header line,
+             * but exclude the second CRLF that ends the header block. */
+            headers_size = (uint32_t)term_pos + (uint32_t)span_get_size(crlf);
+        }
+
         headers->buffer = raw_headers;
-        headers->used_size = span_get_size(raw_headers); // TODO: get the size up to crlf crlf or end.
-        headers->iterator = raw_headers;
+        headers->used_size = headers_size;
+        headers->iterator = span_slice(raw_headers, 0, headers_size);
 
         result = ok;
     }
@@ -132,7 +159,7 @@ HL_RESULT http_headers_find(http_headers_t* headers, span_t name, span_t* value)
 
         result = HL_RESULT_NOT_FOUND;
 
-        while(is_success(span_iterate(remaining_headers, crlf, &current_header, &remaining_headers)))
+        while(span_iterate(remaining_headers, crlf, &current_header, &remaining_headers) == ok)
         {
             span_t current_header_name, current_header_value;
 

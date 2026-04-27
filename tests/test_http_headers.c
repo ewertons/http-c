@@ -158,9 +158,14 @@ static void http_headers_get_buffer_succeed(void **state)
   span_t b = span_from_string(headers_str);
   span_t c;
 
+  /* The header block ends with CRLFCRLF. http_headers_parse trims at the
+   * second CRLF so the returned buffer is the actual header content
+   * (everything up to and including the trailing CRLF of the last header). */
+  span_t expected = span_slice(b, 0, span_get_size(b) - strlitlen(CRLF));
+
   assert_int_equal(http_headers_parse(&headers, b), ok);
   assert_int_equal(http_headers_get_buffer(&headers, &c), HL_RESULT_OK);
-  assert_int_equal(span_compare(c, b), 0);
+  assert_int_equal(span_compare(c, expected), 0);
 }
 
 static void http_headers_add_succeed(void **state)

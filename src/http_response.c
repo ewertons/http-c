@@ -18,6 +18,7 @@ result_t http_response_initialize(http_response_t* response, span_t http_version
         response->code = code;
         response->reason_phrase = reason_phrase;
         response->headers = headers;
+        response->body = SPAN_EMPTY;
         result = ok;
     }
 
@@ -34,6 +35,8 @@ result_t http_response_parse(http_response_t* response, span_t raw_response, spa
     }
     else
     {
+        response->body = SPAN_EMPTY;
+
         if (span_split(raw_response, 0, space, &response->http_version, &raw_response) != 0)
         {
             result = error;
@@ -48,7 +51,21 @@ result_t http_response_parse(http_response_t* response, span_t raw_response, spa
         }
         else
         {
-            result = http_headers_parse(&response->headers, raw_response);
+            span_t headers_part = raw_response;
+            span_t body_part = SPAN_EMPTY;
+            int term = span_find(raw_response, 0, headers_terminator, &body_part);
+            if (term != -1)
+            {
+                headers_part = span_slice(raw_response, 0, (uint32_t)term + (uint32_t)span_get_size(crlf));
+                response->body = body_part;
+            }
+
+            result = http_headers_parse(&response->headers, headers_part);
+        }
+
+        if (out_raw_response_remainder != NULL)
+        {
+            *out_raw_response_remainder = SPAN_EMPTY;
         }
     }
 
@@ -65,8 +82,6 @@ result_t http_response_serialize_to(http_response_t* response, stream_t* stream)
     }
     else
     {
-        span_t raw_headers;
-
         if (failed(stream_write(stream, response->http_version, NULL)))
         {
             result = error;
@@ -75,7 +90,7 @@ result_t http_response_serialize_to(http_response_t* response, stream_t* stream)
         {
             result = error;
         }
-        if (failed(stream_write(stream, response->code, NULL)))
+        else if (failed(stream_write(stream, response->code, NULL)))
         {
             result = error;
         }
@@ -95,8 +110,13 @@ result_t http_response_serialize_to(http_response_t* response, stream_t* stream)
         {
             result = error;
         }
-        // One crlf is already sent by http_headers_serialize_to.
-        else if (failed(stream_write(stream, crlf, NULL))) 
+        /* End of header block. */
+        else if (failed(stream_write(stream, crlf, NULL)))
+        {
+            result = error;
+        }
+        else if (!span_is_empty(response->body) &&
+                 failed(stream_write(stream, response->body, NULL)))
         {
             result = error;
         }

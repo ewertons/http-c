@@ -15,9 +15,24 @@ typedef struct http_response
     span_t code;
     span_t reason_phrase;
     http_headers_t headers;
+    span_t body;
 } http_response_t;
 
 result_t http_response_initialize(http_response_t* response, span_t http_version, span_t code, span_t reason_phrase, http_headers_t headers);
+
+static inline result_t http_response_set_body(http_response_t* response, span_t body)
+{
+    if (response == NULL) return invalid_argument;
+    response->body = body;
+    return ok;
+}
+
+static inline result_t http_response_get_body(http_response_t* response, span_t* body)
+{
+    if (response == NULL || body == NULL) return invalid_argument;
+    *body = response->body;
+    return ok;
+}
 
 // TODO: Change all these to be accessors only... remove code.
 

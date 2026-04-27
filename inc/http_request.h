@@ -15,11 +15,26 @@ typedef struct http_request
     span_t path;
     span_t http_version;
     http_headers_t headers;
+    span_t body;
 } http_request_t;
 
 result_t http_request_initialize(http_request_t *request, span_t method, span_t path, span_t http_version, http_headers_t headers);
 
 result_t http_request_parse(http_request_t* request, span_t raw_request);
+
+static inline result_t http_request_set_body(http_request_t* request, span_t body)
+{
+    if (request == NULL) return invalid_argument;
+    request->body = body;
+    return ok;
+}
+
+static inline result_t http_request_get_body(http_request_t* request, span_t* body)
+{
+    if (request == NULL || body == NULL) return invalid_argument;
+    *body = request->body;
+    return ok;
+}
 
 static inline result_t http_request_get_method(http_request_t* request, span_t* method)
 {

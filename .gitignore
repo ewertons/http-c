@@ -3,3 +3,4 @@ build-bench/
 benchmarks/external/
 benchmarks/results/
 benchmarks/certs/
+samples/certs/

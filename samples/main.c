@@ -28,8 +28,8 @@
 #include "http_codes.h"
 #include "http_versions.h"
 #include "http_headers.h"
-#include "http_connection.h"
 #include "http_endpoint.h"
+#include "http_connection.h"
 #include "http_server.h"
 #include "http_server_storage.h"
 #include "task.h"
@@ -63,6 +63,10 @@ static void print_banner(const char* who, const char* direction)
 
 static void print_headers(http_headers_t* headers)
 {
+    /* Rewind the iterator so this works both for freshly-built headers
+     * (where http_headers_init left iterator empty) and for parsed ones. */
+    headers->iterator = span_slice(headers->buffer, 0, headers->used_size);
+
     span_t name, value;
     while (http_headers_get_next(headers, &name, &value) == HL_RESULT_OK)
     {

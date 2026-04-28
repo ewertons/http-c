@@ -34,8 +34,6 @@ static inline result_t http_response_get_body(http_response_t* response, span_t*
     return ok;
 }
 
-// TODO: Change all these to be accessors only... remove code.
-
 static inline result_t http_response_get_code(http_response_t response, span_t* code)
 {
     if (code == NULL)

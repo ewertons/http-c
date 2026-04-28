@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <sched.h>
 
 #include "span.h"
 #include "niceties.h"
@@ -67,8 +68,9 @@ static result_t read_until_headers_complete(http_connection_t* connection,
 
         if (result == try_again)
         {
-            /* Cooperative retry; let the OS schedule. */
-            task_sleep_ms(1);
+            /* Yield the rest of our timeslice; cheaper than a 1ms sleep
+             * and resumes as soon as the scheduler picks us again. */
+            (void)sched_yield();
             continue;
         }
 
@@ -107,7 +109,7 @@ static result_t read_remaining_body(http_connection_t* connection,
 
         if (r == try_again)
         {
-            task_sleep_ms(1);
+            (void)sched_yield();
             continue;
         }
 
@@ -288,7 +290,6 @@ result_t http_connection_close(http_connection_t* connection)
     }
     else
     {
-        // TODO: add a connection_state flag to know if it is initialized.
         result = stream_close(&connection->stream);
         connection->endpoint = NULL;
     }

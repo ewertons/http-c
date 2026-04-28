@@ -96,7 +96,6 @@ task_t* http_endpoint_wait_for_connection_async(http_endpoint_t* endpoint, http_
     }
     else
     {
-        // TODO: pass a cancellation handler.
         return task_run(internal_wait_for_connection_async, connection);
     }
 }

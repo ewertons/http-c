@@ -31,7 +31,6 @@ result_t http_request_initialize(http_request_t *request, span_t method, span_t 
     return result;
 }
 
-// TODO: return remainder of buffer that has not been parsed.
 result_t http_request_parse(http_request_t *request, span_t raw_request)
 {
     result_t result;

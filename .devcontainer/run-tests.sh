@@ -87,7 +87,6 @@ patch_paths() {
 patch_paths "$ROOT/deps/common-lib-c/tests/src/test_socket.c"
 patch_paths "$ROOT/tests/test_http_endpoint.c"
 patch_paths "$ROOT/tests/test_http_server.c"
-patch_paths "$ROOT/samples/main.c"
 
 echo "==> Configuring + building"
 rm -rf "$ROOT/build"

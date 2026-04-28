@@ -180,10 +180,25 @@ static result_t run_client(void* state, task_t* self)
         return error;
     }
 
+    /* The server's bind/listen happens inside http_server_run, which only
+     * starts after http_server_init returns and the run task is scheduled.
+     * The readiness completion source signals that init succeeded but does
+     * not guarantee the listening socket is up yet, so retry the TCP
+     * connect a few times before giving up. */
     http_connection_t connection;
-    if (http_endpoint_connect(&endpoint, &connection) != ok)
+    result_t connect_result = error;
+    for (int attempt = 0; attempt < 25; attempt++)
     {
-        fprintf(stderr, "client: http_endpoint_connect failed\n");
+        connect_result = http_endpoint_connect(&endpoint, &connection);
+        if (connect_result == ok)
+        {
+            break;
+        }
+        task_sleep_ms(20);
+    }
+    if (connect_result != ok)
+    {
+        fprintf(stderr, "client: http_endpoint_connect failed after retries\n");
         (void)http_endpoint_deinit(&endpoint);
         args->result = error;
         return error;
@@ -357,7 +372,9 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* Block until run_server publishes its init outcome. */
+    /* run_server publishes its init outcome here. The actual bind/listen
+     * happens later inside http_server_run, so the client retries connect
+     * (see run_client) rather than relying on a fixed sleep. */
     if (task_completion_source_wait(&server_ready) != ok)
     {
         (void)task_wait(server_task);
@@ -366,9 +383,6 @@ int main(int argc, char** argv)
         (void)task_platform_deinit();
         return 1;
     }
-
-    /* Give the run loop a moment to enter the accepting state. */
-    task_sleep_ms(50);
 
     /* --- Run the client on a worker task. --- */
     client_args_t client_args = {

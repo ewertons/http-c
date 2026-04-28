@@ -1,7 +1,14 @@
-build/
-build-bench/
 build*/
 benchmarks/external/
 benchmarks/results/
 benchmarks/certs/
 samples/certs/
+
+# CMake artifacts (in case cmake is invoked in-tree)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+.cmake/
+Testing/

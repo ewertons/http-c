@@ -2,6 +2,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -54,6 +55,10 @@ static void server_set_state(http_server_t* server, http_server_state_t s)
 {
     (void)pthread_mutex_lock(&server->state_mutex);
     server->state = s;
+    /* Wake anyone in http_server_stop or another waiter. The broadcast
+     * happens under the mutex so the predicate check on the wake side
+     * always sees this exact transition. */
+    (void)pthread_cond_broadcast(&server->state_cond);
     (void)pthread_mutex_unlock(&server->state_mutex);
 
     /* The callback fields are configured once at init time and never
@@ -522,6 +527,11 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
     {
         return error;
     }
+    if (pthread_cond_init(&server->state_cond, NULL) != 0)
+    {
+        (void)pthread_mutex_destroy(&server->state_mutex);
+        return error;
+    }
 
     server->storage     = storage;
     server->route_count = 0;
@@ -569,6 +579,7 @@ result_t http_server_deinit(http_server_t* server)
     }
     server->route_count = 0;
 
+    (void)pthread_cond_destroy(&server->state_cond);
     (void)pthread_mutex_destroy(&server->state_mutex);
     return ok;
 }
@@ -606,14 +617,35 @@ result_t http_server_stop(http_server_t* server)
         return invalid_argument;
     }
 
-    for (int i = 0; i < 1000; i++)
+    /* Wait (bounded) for the run loop to publish either `running` (the
+     * common case: stop was called after run started up) or `stopped`
+     * (run already exited on its own). Both states are terminal as far
+     * as our wait is concerned. The 1s deadline is a safety net for the
+     * pathological case where http_server_stop is called before
+     * http_server_run was ever spawned -- we still proceed to mark the
+     * server stopping and tell the loop to break out, so a subsequent
+     * run() will observe `stopping` and bail out cleanly. */
+    struct timespec deadline;
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 1;
+
+    (void)pthread_mutex_lock(&server->state_mutex);
+    while (server->state != http_server_state_running &&
+           server->state != http_server_state_stopped)
     {
-        http_server_state_t s = server_get_state(server);
-        if (s == http_server_state_running || s == http_server_state_stopped)
+        if (pthread_cond_timedwait(&server->state_cond,
+                                   &server->state_mutex,
+                                   &deadline) != 0)
         {
-            break;
+            break; /* timeout or error -- proceed anyway */
         }
-        task_sleep_ms(1);
+    }
+    bool already_stopped = (server->state == http_server_state_stopped);
+    (void)pthread_mutex_unlock(&server->state_mutex);
+
+    if (already_stopped)
+    {
+        return ok;
     }
 
     server_set_state(server, http_server_state_stopping);

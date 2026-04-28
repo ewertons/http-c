@@ -146,6 +146,7 @@ struct http_server
 
     http_server_state_t    state;
     pthread_mutex_t        state_mutex;
+    pthread_cond_t         state_cond;     /* broadcast on every state change */
 
     /* Cached from config at init time. */
     http_server_on_state_changed_cb state_changed_cb;

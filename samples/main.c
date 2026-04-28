@@ -180,25 +180,13 @@ static result_t run_client(void* state, task_t* self)
         return error;
     }
 
-    /* The server's bind/listen happens inside http_server_run, which only
-     * starts after http_server_init returns and the run task is scheduled.
-     * The readiness completion source signals that init succeeded but does
-     * not guarantee the listening socket is up yet, so retry the TCP
-     * connect a few times before giving up. */
+    /* The server-side state-changed callback (see on_server_state_changed)
+     * signals readiness only after the listening socket is registered, so
+     * the very first connect() here is guaranteed to succeed. */
     http_connection_t connection;
-    result_t connect_result = error;
-    for (int attempt = 0; attempt < 25; attempt++)
+    if (http_endpoint_connect(&endpoint, &connection) != ok)
     {
-        connect_result = http_endpoint_connect(&endpoint, &connection);
-        if (connect_result == ok)
-        {
-            break;
-        }
-        task_sleep_ms(20);
-    }
-    if (connect_result != ok)
-    {
-        fprintf(stderr, "client: http_endpoint_connect failed after retries\n");
+        fprintf(stderr, "client: http_endpoint_connect failed\n");
         (void)http_endpoint_deinit(&endpoint);
         args->result = error;
         return error;
@@ -279,8 +267,35 @@ typedef struct server_args
     const char*               cert_path;
     const char*               key_path;
     http_server_t*            server;
-    task_completion_source_t* ready;   /* signalled with the init result_t */
+    task_completion_source_t* ready;   /* signalled with init result_t,
+                                          OR replaced by the listening
+                                          signal from on_state_changed */
 } server_args_t;
+
+/* Fires from the server's loop thread on every lifecycle transition.
+ * We treat the running state as "listening socket is up" and signal the
+ * main thread; everything else is informational. */
+static void on_server_state_changed(http_server_t*       server,
+                                    http_server_state_t  new_state,
+                                    void*                user_context)
+{
+    (void)server;
+    server_args_t* args = (server_args_t*)user_context;
+    switch (new_state)
+    {
+        case http_server_state_running:
+            (void)task_completion_source_set_result(args->ready, ok);
+            break;
+        case http_server_state_stopping:
+            printf("server: stopping\n");
+            break;
+        case http_server_state_stopped:
+            printf("server: stopped\n");
+            break;
+        default:
+            break;
+    }
+}
 
 static result_t run_server(void* state, task_t* self)
 {
@@ -288,10 +303,12 @@ static result_t run_server(void* state, task_t* self)
     server_args_t* args = (server_args_t*)state;
 
     http_server_config_t cfg = { 0 };
-    cfg.port                 = SERVER_PORT;
-    cfg.tls.enable           = true;
-    cfg.tls.certificate_file = args->cert_path;
-    cfg.tls.private_key_file = args->key_path;
+    cfg.port                       = SERVER_PORT;
+    cfg.tls.enable                 = true;
+    cfg.tls.certificate_file       = args->cert_path;
+    cfg.tls.private_key_file       = args->key_path;
+    cfg.on_state_changed           = on_server_state_changed;
+    cfg.on_state_changed_context   = args;
 
     if (http_server_init(args->server, &cfg,
                          http_server_storage_get_for_server_host()) != ok)
@@ -312,11 +329,10 @@ static result_t run_server(void* state, task_t* self)
                                 span_from_str_literal("^/$"),
                                 hello_handler, NULL);
 
-    /* Tell the main thread it is safe to start issuing requests. The server
-     * task itself keeps running until http_server_stop() is called. */
-    (void)task_completion_source_set_result(args->ready, ok);
-
-    /* Blocks here until http_server_stop() is called from the main thread. */
+    /* The state-changed callback (above) signals `ready` once the
+     * listening socket is registered, so the main thread can start
+     * issuing requests without a retry loop. http_server_run() blocks
+     * until http_server_stop() is called. */
     result_t run_result = http_server_run(args->server);
 
     (void)http_server_deinit(args->server);
@@ -372,9 +388,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    /* run_server publishes its init outcome here. The actual bind/listen
-     * happens later inside http_server_run, so the client retries connect
-     * (see run_client) rather than relying on a fixed sleep. */
+    /* run_server publishes readiness via the state-changed callback once
+     * the listening socket is up. After this returns ok the kernel is
+     * already queueing connect()s, so the client can connect immediately
+     * without retries. */
     if (task_completion_source_wait(&server_ready) != ok)
     {
         (void)task_wait(server_task);

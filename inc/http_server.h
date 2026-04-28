@@ -18,6 +18,11 @@
 
 #define HTTP_SERVER_DEFAULT_LISTENING_PORT 443
 
+/* Forward declaration so the state-changed callback typedef below can
+ * mention http_server_t* before the struct is defined. */
+struct http_server;
+typedef struct http_server http_server_t;
+
 typedef void (*http_request_handler_t)(http_request_t* request, span_t* path_matches, uint16_t number_of_matches, http_response_t* out_response, void* user_context);
 
 typedef enum
@@ -27,6 +32,27 @@ typedef enum
     http_server_state_stopping    = 0x12,
     http_server_state_stopped     = 0x13
 } http_server_state_t;
+
+/**
+ * @brief Invoked on every server lifecycle state transition.
+ *
+ * Fires from inside #http_server_run (i.e. on the server task's thread)
+ * for the following transitions:
+ *   - http_server_state_running   The listening socket is bound and
+ *                                 registered with the event loop. It is
+ *                                 safe for clients to begin connecting.
+ *   - http_server_state_stopping  #http_server_stop has been called and
+ *                                 the event loop is being torn down.
+ *   - http_server_state_stopped   The run loop has fully exited and all
+ *                                 in-flight connections have been closed.
+ *
+ * The callback runs on the server's loop thread and must not block or
+ * call back into #http_server_run / #http_server_stop. It is intended for
+ * lightweight signalling (e.g. setting a #task_completion_source_t).
+ */
+typedef void (*http_server_on_state_changed_cb)(http_server_t*       server,
+                                                http_server_state_t  new_state,
+                                                void*                user_context);
 
 typedef struct http_route
 {
@@ -98,9 +124,14 @@ typedef struct http_server_config
         const char* certificate_file;
         const char* private_key_file;
     } tls;
+
+    /* Optional. Invoked on lifecycle transitions; see
+     * #http_server_on_state_changed_cb for the contract. */
+    http_server_on_state_changed_cb on_state_changed;
+    void*                           on_state_changed_context;
 } http_server_config_t;
 
-typedef struct http_server
+struct http_server
 {
     http_endpoint_config_t local_endpoint_config;
     http_endpoint_t        local_endpoint;
@@ -115,7 +146,11 @@ typedef struct http_server
 
     http_server_state_t    state;
     pthread_mutex_t        state_mutex;
-} http_server_t;
+
+    /* Cached from config at init time. */
+    http_server_on_state_changed_cb state_changed_cb;
+    void*                           state_changed_ctx;
+};
 
 static inline http_server_config_t http_server_get_default_config()
 {

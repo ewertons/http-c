@@ -55,6 +55,14 @@ static void server_set_state(http_server_t* server, http_server_state_t s)
     (void)pthread_mutex_lock(&server->state_mutex);
     server->state = s;
     (void)pthread_mutex_unlock(&server->state_mutex);
+
+    /* The callback fields are configured once at init time and never
+     * mutated afterwards, so no locking is required. The callback runs
+     * outside the state mutex so it can safely take other locks. */
+    if (server->state_changed_cb != NULL)
+    {
+        server->state_changed_cb(server, s, server->state_changed_ctx);
+    }
 }
 
 /* Returns NULL if no slot is available. */
@@ -537,6 +545,9 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
     lc->tls.certificate_file     = config->tls.certificate_file;
     lc->tls.private_key_file     = config->tls.private_key_file;
 
+    server->state_changed_cb  = config->on_state_changed;
+    server->state_changed_ctx = config->on_state_changed_context;
+
     server->state = http_server_state_initialized;
     return ok;
 }
@@ -693,12 +704,23 @@ result_t http_server_run(http_server_t* server)
     }
     server->listen_registered = true;
 
+    /* Listening socket is bound and registered with the event loop, so
+     * connect()s from clients will be queued by the kernel from this
+     * point on. Publish the running state (which fires the
+     * on_state_changed callback) BEFORE entering the run loop. We only
+     * promote from `initialized` to `running`; any other state means
+     * stop() was already called and we must not regress it. */
+    bool publish_running = false;
     (void)pthread_mutex_lock(&server->state_mutex);
     if (server->state == http_server_state_initialized)
     {
-        server->state = http_server_state_running;
+        publish_running = true;
     }
     (void)pthread_mutex_unlock(&server->state_mutex);
+    if (publish_running)
+    {
+        server_set_state(server, http_server_state_running);
+    }
 
     result_t result = event_loop_run(&server->loop);
 

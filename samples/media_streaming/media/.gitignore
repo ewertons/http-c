@@ -1,0 +1,4 @@
+# Generated at runtime by launch_with_docker.cmd or by the manual ffmpeg
+# commands in README.md. Not source.
+*
+!.gitignore

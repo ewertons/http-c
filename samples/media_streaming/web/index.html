@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>http-c media streaming demo</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <main>
+        <h1>http-c media streaming</h1>
+        <p class="lede">
+            Two media files served straight off a Linux host by the
+            <code>http-c</code> library, over HTTPS, with HTTP Range
+            requests. Click a button; the browser will issue a stream
+            of small range requests and the server will reply to each
+            with a 206 slice.
+        </p>
+
+        <section>
+            <h2>Video</h2>
+            <video id="player-video" controls loop playsinline preload="none"></video>
+            <div class="controls">
+                <button id="btn-video-play">Play video</button>
+            </div>
+        </section>
+
+        <section>
+            <h2>Audio</h2>
+            <audio id="player-audio" controls loop preload="none"></audio>
+            <div class="controls">
+                <button id="btn-audio-play">Play audio</button>
+            </div>
+        </section>
+
+        <section>
+            <h2>Stop</h2>
+            <div class="controls">
+                <button id="btn-stop" class="stop">Stop everything</button>
+            </div>
+            <p id="status" class="status">idle</p>
+        </section>
+    </main>
+    <script src="/script.js" defer></script>
+</body>
+</html>

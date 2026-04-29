@@ -34,6 +34,58 @@ command -v gcovr >/dev/null 2>&1 || {
     exit 1
 }
 
+# ---------------------------------------------------------------------------
+# Provision the TLS test certificates that the socket/http_endpoint/http_server
+# integration tests expect at /tmp/http-c-certs/. Without these, ~1000 lines
+# of socket.c / http_connection.c / http_server.c never run and the coverage
+# number understates the true exercised surface.
+# ---------------------------------------------------------------------------
+CERT_DIR="/tmp/http-c-certs"
+if [[ ! -f "${CERT_DIR}/server/server.cert.pem" ]]; then
+    echo "==> Provisioning TLS test certs under ${CERT_DIR}"
+    mkdir -p "${CERT_DIR}/ca" "${CERT_DIR}/client" "${CERT_DIR}/server"
+
+    # Self-signed CA (acts as its own intermediate; the chain.ca is just the
+    # CA itself which is enough for the simple verify the tests perform).
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -sha256 \
+        -keyout "${CERT_DIR}/ca/ca.key.pem" \
+        -out    "${CERT_DIR}/ca/chain.ca.cert.pem" \
+        -subj "/CN=http-c-test-ca" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,digitalSignature" \
+        >/dev/null 2>&1
+
+    # Server cert signed by the CA, with localhost SAN.
+    openssl req -newkey rsa:2048 -nodes \
+        -keyout "${CERT_DIR}/server/server.key.pem" \
+        -out    "${CERT_DIR}/server/server.csr.pem" \
+        -subj "/CN=localhost" \
+        >/dev/null 2>&1
+    openssl x509 -req -in "${CERT_DIR}/server/server.csr.pem" \
+        -CA "${CERT_DIR}/ca/chain.ca.cert.pem" \
+        -CAkey "${CERT_DIR}/ca/ca.key.pem" \
+        -CAcreateserial \
+        -days 30 -sha256 \
+        -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n") \
+        -out "${CERT_DIR}/server/server.cert.pem" \
+        >/dev/null 2>&1
+
+    # Client cert signed by the same CA.
+    openssl req -newkey rsa:2048 -nodes \
+        -keyout "${CERT_DIR}/client/client.key.pem" \
+        -out    "${CERT_DIR}/client/client.csr.pem" \
+        -subj "/CN=http-c-test-client" \
+        >/dev/null 2>&1
+    openssl x509 -req -in "${CERT_DIR}/client/client.csr.pem" \
+        -CA "${CERT_DIR}/ca/chain.ca.cert.pem" \
+        -CAkey "${CERT_DIR}/ca/ca.key.pem" \
+        -CAcreateserial \
+        -days 30 -sha256 \
+        -extfile <(printf "extendedKeyUsage=clientAuth\n") \
+        -out "${CERT_DIR}/client/client.cert.pem" \
+        >/dev/null 2>&1
+fi
+
 echo "==> Configuring (HTTP_C_COVERAGE=ON)"
 cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Debug \

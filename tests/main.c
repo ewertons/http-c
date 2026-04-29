@@ -19,6 +19,7 @@ int main()
   result += test_http_request();
   result += test_http_request_parser();
   result += test_http_response();
+  result += test_http_server_storage();
   task_platform_init();
   result += test_http_endpoint();
   result += test_http_server();

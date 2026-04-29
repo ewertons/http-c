@@ -96,3 +96,23 @@ cmake --build "$ROOT/build" -j"$(nproc)"
 echo "==> Running tests"
 cd "$ROOT/build"
 ctest --output-on-failure --timeout 30
+
+# ---------------------------------------------------------------------------
+# Second pass: build everything as shared objects (BUILD_SHARED_LIBS=ON)
+# and run only the shared_link_consumer test. This validates that
+# libhttp.so / libcommon-lib-c.so export every symbol the public headers
+# reference and that the consumer can be dynamically linked against
+# them. Static linkage is already exercised by the run above.
+# ---------------------------------------------------------------------------
+echo "==> Configuring + building (BUILD_SHARED_LIBS=ON)"
+rm -rf "$ROOT/build-shared"
+cmake -S "$ROOT" -B "$ROOT/build-shared" -DBUILD_SHARED_LIBS=ON >/dev/null
+cmake --build "$ROOT/build-shared" -j"$(nproc)" --target shared_link_consumer
+
+echo "==> Verifying libraries are actually shared objects"
+ls -l "$ROOT/build-shared/libhttp.so" \
+      "$ROOT/build-shared/deps/common-lib-c/libcommon-lib-c.so"
+
+echo "==> Running shared_link_consumer test"
+cd "$ROOT/build-shared"
+ctest --output-on-failure --timeout 30 -R shared_link_consumer

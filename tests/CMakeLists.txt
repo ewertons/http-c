@@ -26,3 +26,8 @@ target_link_libraries(${TARGET_NAME} http common-lib-c cmocka pthread)
 
 add_test(${TARGET_NAME} ${TARGET_NAME})
 
+# Shared-object linkage validation. When configured with
+# -DBUILD_SHARED_LIBS=ON this test exercises the .so version of
+# libhttp and libcommon-lib-c via a separate consumer binary.
+add_subdirectory(shared_link)
+

@@ -7,9 +7,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-
 #include "common_lib_c.h"
 
 #include "http_server.h"
@@ -284,47 +281,46 @@ static void slot_drive_receive(http_server_connection_slot_t* slot)
             return;
         }
 
-        ERR_clear_error();
-        int n = SSL_read(sock->ssl,
-                         slot->recv_buffer_ptr + slot->recv_used,
-                         (int)(slot->recv_buffer_size - slot->recv_used));
-        if (n > 0)
+        uint32_t got = 0;
+        result_t rr = socket_read_nb(sock,
+                                     slot->recv_buffer_ptr + slot->recv_used,
+                                     slot->recv_buffer_size - slot->recv_used,
+                                     &got);
+        if (rr == try_again)
         {
-            slot->recv_used += (uint32_t)n;
-
-            span_t buf = span_init(slot->recv_buffer_ptr, slot->recv_used);
-            result_t pr = http_request_parser_feed(&slot->parser, buf);
-
-            if (pr == ok)
-            {
-                http_request_t* req = http_request_parser_get_request(&slot->parser);
-                slot->client_wants_close = client_wants_close(req);
-                run_handler_and_serialize(slot, req);
-                return;
-            }
-            if (pr == try_again)
-            {
-                /* Need more bytes — but the SSL record layer may already
-                 * have buffered some. Retry SSL_read immediately. */
-                continue;
-            }
-            log_error("request parse error");
+            uint32_t want = socket_get_io_want(sock);
+            uint32_t events = (want & socket_io_want_write)
+                                ? event_loop_event_write
+                                : event_loop_event_read;
+            slot_arm(slot, events);
+            return;
+        }
+        if (rr != ok)
+        {
+            /* end_of_data or error -- close the connection. */
             slot_close(slot);
             return;
         }
 
-        int sslerr = SSL_get_error(sock->ssl, n);
-        if (sslerr == SSL_ERROR_WANT_READ)
+        slot->recv_used += got;
+
+        span_t buf = span_init(slot->recv_buffer_ptr, slot->recv_used);
+        result_t pr = http_request_parser_feed(&slot->parser, buf);
+
+        if (pr == ok)
         {
-            slot_arm(slot, event_loop_event_read);
+            http_request_t* req = http_request_parser_get_request(&slot->parser);
+            slot->client_wants_close = client_wants_close(req);
+            run_handler_and_serialize(slot, req);
             return;
         }
-        if (sslerr == SSL_ERROR_WANT_WRITE)
+        if (pr == try_again)
         {
-            slot_arm(slot, event_loop_event_write);
-            return;
+            /* Need more bytes -- the TLS record layer or kernel buffer
+             * may already have more, so retry the non-blocking read. */
+            continue;
         }
-        /* ZERO_RETURN, SYSCALL, SSL → done. */
+        log_error("request parse error");
         slot_close(slot);
         return;
     }
@@ -554,7 +550,6 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
     lc->tls.enable               = config->tls.enable;
     lc->tls.certificate_file     = config->tls.certificate_file;
     lc->tls.private_key_file     = config->tls.private_key_file;
-
     server->state_changed_cb  = config->on_state_changed;
     server->state_changed_ctx = config->on_state_changed_context;
 

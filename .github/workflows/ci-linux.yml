@@ -1,0 +1,42 @@
+name: CI (Linux)
+
+# Trigger on PRs and pushes to long-lived branches, plus a manual
+# `workflow_dispatch` so this workflow can be invoked ad hoc from the
+# GitHub UI / `gh workflow run` against any branch (e.g. running `main`
+# on demand or re-running on a feature branch without opening a PR).
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to build (informational; the
+          run still uses the ref selected in the UI dropdown).'
+        required: false
+        default: ''
+
+jobs:
+  build-and-test:
+    name: Build & run tests (Ubuntu 24.04 container)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Build dev container image
+        run: |
+          docker build -t http-c-build:ubuntu24 -f .devcontainer/Dockerfile .
+
+      - name: Build and run tests inside container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            http-c-build:ubuntu24 \
+            bash .devcontainer/run-tests.sh

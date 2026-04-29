@@ -25,6 +25,7 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
         {
             endpoint->socket_config = socket_get_default_secure_server_config();
             endpoint->socket_config.local = config->local;
+            endpoint->socket_config.tls.enable = config->tls.enable;
             endpoint->socket_config.tls.certificate_file = config->tls.certificate_file;
             endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
             
@@ -34,6 +35,7 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
         {
             endpoint->socket_config = socket_get_default_secure_client_config();
             endpoint->socket_config.remote = config->remote;
+            endpoint->socket_config.tls.enable = config->tls.enable;
             endpoint->socket_config.tls.certificate_file = config->tls.certificate_file;
             endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
             endpoint->socket_config.tls.trusted_certificate_file = config->tls.trusted_certificate_file;

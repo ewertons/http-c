@@ -40,6 +40,7 @@
 #define PORT_METHOD_MISMATCH 4405
 #define PORT_KEEP_ALIVE      4406
 #define PORT_PARALLEL        4407
+#define PORT_PLAIN_HTTP      4408
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -60,6 +61,15 @@ static void server_set_default_tls(http_server_config_t* cfg, int port)
     cfg->tls.private_key_file = SERVER_PK_PATH;
 }
 
+static void server_set_plain(http_server_config_t* cfg, int port)
+{
+    *cfg = http_server_get_default_config();
+    cfg->port = port;
+    cfg->tls.enable = false;
+    cfg->tls.certificate_file = NULL;
+    cfg->tls.private_key_file = NULL;
+}
+
 static void client_connect(test_client_t* client, int port)
 {
     http_endpoint_config_t cfg = http_endpoint_get_default_secure_client_config();
@@ -68,6 +78,18 @@ static void client_connect(test_client_t* client, int port)
     cfg.tls.certificate_file = CLIENT_CERT_PATH;
     cfg.tls.private_key_file = CLIENT_PK_PATH;
     cfg.tls.trusted_certificate_file = CA_CHAIN_PATH;
+
+    assert_int_equal(http_endpoint_init(&client->endpoint, &cfg), ok);
+    assert_int_equal(http_endpoint_connect(&client->endpoint, &client->connection), ok);
+}
+
+static void client_connect_plain(test_client_t* client, int port)
+{
+    http_endpoint_config_t cfg = { 0 };
+    cfg.role = http_endpoint_client;
+    cfg.tls.enable = false;
+    cfg.remote.hostname = span_from_str_literal("localhost");
+    cfg.remote.port = port;
 
     assert_int_equal(http_endpoint_init(&client->endpoint, &cfg), ok);
     assert_int_equal(http_endpoint_connect(&client->endpoint, &client->connection), ok);
@@ -756,6 +778,58 @@ static void http_server_handles_parallel_clients_succeed(void** state)
     handler_capture_destroy(&handler);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Plain-HTTP (no TLS) end-to-end test. Verifies the server and client
+ * negotiate a plaintext TCP connection and successfully exchange a
+ * GET/200 round-trip when tls.enable=false.
+ * ------------------------------------------------------------------------- */
+static void http_server_plain_http_GET_request_succeed(void** state)
+{
+    (void)state;
+    handler_capture_t handler;
+    handler_capture_init(&handler);
+    handler.response_body = span_from_str_literal("plain-hello");
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_PLAIN_HTTP);
+
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/$"),
+                                           capturing_handler, &handler), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_PLAIN_HTTP);
+
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true /* Connection: close */);
+
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL),
+                     ok);
+
+    assert_int_equal(span_compare(response.code, HTTP_CODE_200), 0);
+
+    wait_for_handler(&handler, 1000);
+    assert_true(handler.invoked);
+    assert_int_equal(span_compare(handler.method, HTTP_METHOD_GET), 0);
+
+    client_disconnect(&client);
+
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    handler_capture_destroy(&handler);
+}
+
 /* ------------------------------------------------------------------------- */
 
 int test_http_server()
@@ -785,6 +859,7 @@ int test_http_server()
         cmocka_unit_test(http_server_returns_405_for_method_mismatch),
         cmocka_unit_test(http_server_keep_alive_multiple_requests_succeed),
         cmocka_unit_test(http_server_handles_parallel_clients_succeed),
+        cmocka_unit_test(http_server_plain_http_GET_request_succeed),
     };
 
     return cmocka_run_group_tests_name("http_server", tests, NULL, NULL);

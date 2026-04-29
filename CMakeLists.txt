@@ -3,6 +3,28 @@ project(http)
 
 enable_testing()
 
+# ---------------------------------------------------------------------------
+# Optional code coverage instrumentation.
+#
+#   cmake -S . -B build-cov -DHTTP_C_COVERAGE=ON
+#   cmake --build build-cov
+#   (cd build-cov && ctest --output-on-failure)
+#   gcovr -r . --html --html-details -o build-cov/coverage.html build-cov
+#
+# scripts/run-coverage.sh wraps all of that. The flags propagate to every
+# target in this build (including deps/common-lib-c) via the directory-
+# scoped add_compile_options/add_link_options below.
+# ---------------------------------------------------------------------------
+option(HTTP_C_COVERAGE "Build with gcov instrumentation" OFF)
+if(HTTP_C_COVERAGE)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        message(WARNING "HTTP_C_COVERAGE only tested with gcc/clang; you have ${CMAKE_C_COMPILER_ID}")
+    endif()
+    add_compile_options(-O0 -g --coverage -fprofile-arcs -ftest-coverage)
+    add_link_options(--coverage)
+    message(STATUS "HTTP_C_COVERAGE=ON -- instrumenting for gcov")
+endif()
+
 add_subdirectory(deps/common-lib-c)
 
 set(

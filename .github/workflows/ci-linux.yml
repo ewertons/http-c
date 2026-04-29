@@ -23,26 +23,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # The repo's Actions policy disallows third-party actions
-      # (including actions/checkout). Clone manually with the
-      # auto-provided GITHUB_TOKEN instead. We check out the exact
-      # ref that triggered the workflow and recursively initialize
-      # submodules (deps/common-lib-c).
-      - name: Checkout repository (manual git clone)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git init .
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git -c protocol.version=2 fetch --depth=1 origin "${GITHUB_SHA}"
-          git checkout --detach FETCH_HEAD
-          # Submodule URLs in .gitmodules use https://github.com/...,
-          # which is fine for public repos but we inject the same
-          # token in case any submodule is private.
-          git submodule sync --recursive
-          git -c "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf=https://github.com/" \
-              submodule update --init --recursive --depth=1
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
 
       - name: Build dev container image
         run: |

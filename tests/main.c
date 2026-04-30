@@ -16,6 +16,7 @@ int main()
   int result = 0;
 
   result += test_http_headers();
+  result += test_http_query();
   result += test_http_request();
   result += test_http_request_parser();
   result += test_http_response();

@@ -30,6 +30,7 @@ add_subdirectory(deps/common-lib-c)
 set(
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/http_headers.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/http_query.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_request.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_request_parser.c
     ${CMAKE_CURRENT_LIST_DIR}/src/http_response.c

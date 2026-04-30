@@ -4,6 +4,7 @@
 int test_http_request();
 int test_http_request_parser();
 int test_http_headers();
+int test_http_query();
 int test_http_response();
 int test_http_server();
 int test_http_endpoint();

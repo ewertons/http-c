@@ -283,8 +283,8 @@ static void slot_drive_receive(http_server_connection_slot_t* slot)
 
         uint32_t got = 0;
         result_t rr = socket_read_nb(sock,
-                                     slot->recv_buffer_ptr + slot->recv_used,
-                                     slot->recv_buffer_size - slot->recv_used,
+                                     span_init(slot->recv_buffer_ptr + slot->recv_used,
+                                               slot->recv_buffer_size - slot->recv_used),
                                      &got);
         if (rr == try_again)
         {

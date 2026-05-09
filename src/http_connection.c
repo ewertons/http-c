@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #include <sched.h>
 
 #include "span.h"
@@ -9,6 +10,126 @@
 #include "http_endpoint.h"
 #include "http_connection.h"
 #include "http_headers.h"
+
+/* ------------------------------------------------------------------ */
+/* Internal: ensure at least `need` bytes are available in the read    */
+/* window starting at buf[*pos].  Reads from the stream if needed,    */
+/* appending into buf and advancing *len.  Returns ok when satisfied.  */
+/* ------------------------------------------------------------------ */
+static result_t ensure_buffered(http_connection_t* connection,
+                                uint8_t* buf, uint32_t buf_cap,
+                                uint32_t* len, uint32_t pos,
+                                uint32_t need)
+{
+    while (*len - pos < need)
+    {
+        if (*len >= buf_cap) return insufficient_size;
+        span_t dst  = span_init(buf + *len, buf_cap - *len);
+        span_t got, after;
+        result_t r = stream_read(&connection->stream, dst, &got, &after);
+        if (r == try_again) { (void)sched_yield(); continue; }
+        if (is_error(r) || r == end_of_data || r == end_of_file)
+        {
+            return (r == end_of_file || r == end_of_data) ? error : r;
+        }
+        *len += span_get_size(got);
+    }
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Internal: read a chunked transfer-encoded body.                     */
+/*                                                                     */
+/* `remainder` points into the caller's buffer just after the parsed   */
+/* headers; it may already contain the beginning of the chunk stream.  */
+/* The dechunked body is written compactly into `out_buf` (which may   */
+/* overlap with the remainder region — we always copy forward so this  */
+/* is safe as long as out_buf <= remainder_ptr).                       */
+/* ------------------------------------------------------------------ */
+static result_t read_chunked_body(http_connection_t* connection,
+                                  uint8_t* out_buf,
+                                  uint32_t out_cap,
+                                  uint32_t* out_len,
+                                  span_t   remainder,
+                                  uint8_t* raw_buf,
+                                  uint32_t raw_cap)
+{
+    /* Copy remainder into the beginning of raw_buf if not already there. */
+    uint32_t rlen = span_get_size(remainder);
+    uint8_t* rptr = span_get_ptr(remainder);
+    if (rlen > 0 && rptr != raw_buf)
+    {
+        if (rlen > raw_cap) rlen = raw_cap;
+        memmove(raw_buf, rptr, rlen);
+    }
+    uint32_t raw_len = rlen;  /* bytes currently in raw_buf */
+    uint32_t pos = 0;         /* parse cursor within raw_buf */
+    uint32_t olen = 0;        /* dechunked bytes written */
+
+    for (;;)
+    {
+        /* --- Parse chunk-size line: hex digits terminated by \r\n --- */
+        /* Ensure we have at least one byte to start parsing. */
+        result_t r = ensure_buffered(connection, raw_buf, raw_cap,
+                                     &raw_len, pos, 1);
+        if (is_error(r)) return r;
+
+        uint32_t chunk_size = 0;
+        /* Read hex digits. */
+        while (pos < raw_len)
+        {
+            uint8_t c = raw_buf[pos];
+            if      (c >= '0' && c <= '9') { chunk_size = chunk_size * 16 + (c - '0'); pos++; }
+            else if (c >= 'a' && c <= 'f') { chunk_size = chunk_size * 16 + (c - 'a' + 10); pos++; }
+            else if (c >= 'A' && c <= 'F') { chunk_size = chunk_size * 16 + (c - 'A' + 10); pos++; }
+            else break; /* hit \r, \n, or ';' (chunk extension) */
+        }
+        /* Skip any chunk extensions (everything up to \r\n). */
+        for (;;)
+        {
+            r = ensure_buffered(connection, raw_buf, raw_cap,
+                                &raw_len, pos, 1);
+            if (is_error(r)) return r;
+            if (raw_buf[pos] == '\n') { pos++; break; }
+            pos++;
+        }
+
+        if (chunk_size == 0) break; /* Last chunk. */
+
+        /* --- Read chunk_size bytes of data --- */
+        uint32_t remaining = chunk_size;
+        while (remaining > 0)
+        {
+            /* Ensure we have at least 1 byte of chunk data. */
+            r = ensure_buffered(connection, raw_buf, raw_cap,
+                                &raw_len, pos, 1);
+            if (is_error(r)) return r;
+
+            uint32_t avail = raw_len - pos;
+            uint32_t take = (avail < remaining) ? avail : remaining;
+            if (olen + take > out_cap) take = out_cap - olen;
+            if (take == 0) return insufficient_size;
+
+            memcpy(out_buf + olen, raw_buf + pos, take);
+            olen  += take;
+            pos   += take;
+            remaining -= take;
+        }
+
+        /* --- Skip trailing \r\n after chunk data --- */
+        r = ensure_buffered(connection, raw_buf, raw_cap,
+                            &raw_len, pos, 2);
+        if (is_error(r)) return r;
+        if (raw_buf[pos] == '\r') pos++;
+        if (raw_buf[pos] == '\n') pos++;
+    }
+
+    /* Skip optional trailers + final \r\n after the last chunk. */
+    /* (We don't parse trailers; just consume them.) */
+
+    *out_len = olen;
+    return ok;
+}
 
 result_t http_connection_set_endpoint(http_connection_t* connection, http_endpoint_t* endpoint)
 {
@@ -139,25 +260,80 @@ static result_t maybe_read_body(http_connection_t* connection,
                                 span_t free_buffer)
 {
     static const span_t HDR_CONTENT_LENGTH = span_from_str_literal("Content-Length");
+    static const span_t HDR_TRANSFER_ENCODING = span_from_str_literal("Transfer-Encoding");
 
+    /* 1. Content-Length takes priority. */
     span_t value;
-    if (http_headers_find(headers, HDR_CONTENT_LENGTH, &value) != HL_RESULT_OK)
+    if (http_headers_find(headers, HDR_CONTENT_LENGTH, &value) == HL_RESULT_OK)
     {
-        return ok;
+        uint32_t content_length = 0;
+        if (span_to_uint32_t(value, &content_length) != 0)
+        {
+            return error;
+        }
+        if (content_length == 0) return ok;
+        return read_remaining_body(connection, body, free_buffer, content_length);
     }
 
-    uint32_t content_length = 0;
-    if (span_to_uint32_t(value, &content_length) != 0)
+    /* 2. Check for Transfer-Encoding: chunked. */
+    span_t te_value;
+    if (http_headers_find(headers, HDR_TRANSFER_ENCODING, &te_value) == HL_RESULT_OK)
     {
-        return error;
+        /* Case-insensitive check for "chunked". */
+        uint32_t te_len = span_get_size(te_value);
+        const char* te_str = (const char*)span_get_ptr(te_value);
+        bool is_chunked = false;
+        if (te_len >= 7)
+        {
+            /* Look for "chunked" anywhere in the value (could be
+             * "chunked" or "gzip, chunked" etc.). */
+            for (uint32_t i = 0; i + 7 <= te_len; i++)
+            {
+                if ((te_str[i]   == 'c' || te_str[i]   == 'C') &&
+                    (te_str[i+1] == 'h' || te_str[i+1] == 'H') &&
+                    (te_str[i+2] == 'u' || te_str[i+2] == 'U') &&
+                    (te_str[i+3] == 'n' || te_str[i+3] == 'N') &&
+                    (te_str[i+4] == 'k' || te_str[i+4] == 'K') &&
+                    (te_str[i+5] == 'e' || te_str[i+5] == 'E') &&
+                    (te_str[i+6] == 'd' || te_str[i+6] == 'D'))
+                {
+                    is_chunked = true;
+                    break;
+                }
+            }
+        }
+
+        if (is_chunked)
+        {
+            /* The dechunked output goes into the start of free_buffer.
+             * We use a separate area for raw chunked I/O — if the
+             * remainder already lives inside free_buffer we reuse the
+             * same allocation, just dechunk in-place forward. */
+            uint8_t* out_ptr = span_get_ptr(free_buffer);
+            uint32_t out_cap = span_get_size(free_buffer);
+
+            /* Use a heap buffer for raw chunked data so we don't
+             * collide with the output area that may overlap. */
+            uint32_t raw_cap = out_cap;
+            uint8_t* raw_buf = (uint8_t*)malloc(raw_cap);
+            if (raw_buf == NULL) return error;
+
+            uint32_t body_len = 0;
+            result_t r = read_chunked_body(connection,
+                                           out_ptr, out_cap, &body_len,
+                                           *body, /* remainder from header read */
+                                           raw_buf, raw_cap);
+            free(raw_buf);
+
+            if (is_error(r)) return r;
+
+            *body = span_init(out_ptr, body_len);
+            return ok;
+        }
     }
 
-    if (content_length == 0)
-    {
-        return ok;
-    }
-
-    return read_remaining_body(connection, body, free_buffer, content_length);
+    /* 3. No Content-Length, not chunked — no body. */
+    return ok;
 }
 
 result_t http_connection_receive_request(http_connection_t* connection, span_t buffer, http_request_t* request, span_t* out_buffer_remainder)

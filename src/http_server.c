@@ -19,7 +19,7 @@
 #include "http_request_parser.h"
 #include "common.h"
 #include "event_loop.h"
-#include "logging_simple.h"
+#include "logging.h"
 
 /* ------------------------------------------------------------------------- *
  * Forward declarations.

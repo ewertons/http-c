@@ -115,7 +115,6 @@ HL_RESULT http_headers_get_next(http_headers_t* headers, span_t* name, span_t* v
             }
             else
             {
-                span_t iterator = headers->iterator;
                 span_t current_header;
 
                 if (span_split(headers->iterator, 0, crlf, &current_header, &headers->iterator) != 0)

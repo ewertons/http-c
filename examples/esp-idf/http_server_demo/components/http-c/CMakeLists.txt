@@ -46,7 +46,7 @@ idf_component_register(
         "${HTTP_C_ROOT}/deps/common-lib-c/src/socket.c"
         "${HTTP_C_ROOT}/deps/common-lib-c/src/socket_stream.c"
         "${HTTP_C_ROOT}/deps/common-lib-c/src/span.c"
-        "${HTTP_C_ROOT}/deps/common-lib-c/src/stack.c"
+        "${HTTP_C_ROOT}/deps/common-lib-c/src/stackx.c"
         "${HTTP_C_ROOT}/deps/common-lib-c/src/stringx.c"
         "${HTTP_C_ROOT}/deps/common-lib-c/src/task.c"
     INCLUDE_DIRS

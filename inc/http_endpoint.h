@@ -4,7 +4,7 @@
 #include <span.h>
 
 #include "niceties.h"
-#include "socket.h"
+#include "socketx.h"
 #include "task.h"
 
 typedef enum http_endpoint_role

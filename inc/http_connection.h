@@ -4,7 +4,7 @@
 #include <span.h>
 #include "niceties.h"
 #include "stream.h"
-#include "socket.h"
+#include "socketx.h"
 
 #include "http_endpoint.h"
 #include "http_request.h"

@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <pthread.h>
 
-#include "socket.h"
+#include "socketx.h"
 #include "task.h"
 #include "span.h"
 #include "event_loop.h"

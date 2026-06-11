@@ -3,7 +3,7 @@
 
 #include "span.h"
 #include "niceties.h"
-#include "socket.h"
+#include "socketx.h"
 #include "socket_stream.h"
 
 #include "http_endpoint.h"

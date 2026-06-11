@@ -51,10 +51,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Note: deliberately not including the "common_lib_c.h" umbrella here.
- * It pulls in common-lib-c's `stack_t` (an unrelated container type)
- * which collides with POSIX's `stack_t` from <signal.h>. The http-c
- * headers below give us everything this sample actually needs. */
+/* The http-c headers below give us everything this sample actually needs,
+ * so the "common_lib_c.h" umbrella header is intentionally not included. */
 
 #include <http_request.h>
 #include <http_response.h>

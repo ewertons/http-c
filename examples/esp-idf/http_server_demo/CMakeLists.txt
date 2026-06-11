@@ -4,15 +4,14 @@
 #   idf.py set-target esp32
 #   idf.py build
 #
-# This project consumes the http-c repository (three levels up) directly as
-# an ESP-IDF component. The repository's root CMakeLists.txt registers itself
-# as a component when ESP_PLATFORM is defined. The Wi-Fi/Ethernet bring-up
-# uses the protocol_examples_common helper component shipped with ESP-IDF.
+# The http-c library is vendored as an auto-discovered component under
+# components/http-c (its CMakeLists compiles the library sources from the
+# repository root). The Wi-Fi/Ethernet bring-up uses the
+# protocol_examples_common helper component shipped with ESP-IDF.
 
 cmake_minimum_required(VERSION 3.18)
 
 set(EXTRA_COMPONENT_DIRS
-    ${CMAKE_CURRENT_LIST_DIR}/../../..
     $ENV{IDF_PATH}/examples/common_components/protocol_examples_common
 )
 

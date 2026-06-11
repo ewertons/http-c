@@ -1,0 +1,10 @@
+# Defaults for the http-c ESP-IDF example.
+#
+# http-c drives sockets in non-blocking mode through a single select() loop
+# and uses a small pthread shim from common-lib-c. The values below give the
+# loop room for the microcontroller storage preset (4 connections + the
+# listening socket) and a comfortable main-task stack.
+
+CONFIG_LWIP_MAX_SOCKETS=10
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

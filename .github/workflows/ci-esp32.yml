@@ -1,0 +1,41 @@
+name: CI (ESP32 / ESP-IDF)
+
+# Validates that the http-c library compiles and links against ESP-IDF
+# (lwIP + mbedTLS, no OpenSSL, select() event-loop backend) by building the
+# examples/esp-idf/http_server_demo application with the official Espressif
+# Docker image. This is a build-only check -- no hardware is flashed.
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  esp-idf-build:
+    name: Build ESP-IDF example
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # A couple of representative targets covering Xtensa (esp32) and
+        # RISC-V (esp32c3) cores.
+        target: [esp32, esp32c3]
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # The espressif/esp-idf-ci-action wraps the official esp-idf Docker
+      # image, exports the toolchain, runs `idf.py set-target` + `build`.
+      - name: Build with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3
+          target: ${{ matrix.target }}
+          path: examples/esp-idf/http_server_demo

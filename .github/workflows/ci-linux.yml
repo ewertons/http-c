@@ -40,3 +40,38 @@ jobs:
             -w /work \
             http-c-build:ubuntu24 \
             bash .devcontainer/run-tests.sh
+
+  portability-build:
+    name: Portable build (TLS-none + select backend)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build gcc
+
+      # Mirrors the toolchain constraints of the ESP-IDF target: no OpenSSL
+      # (SOCKET_TLS_NONE) and the portable select() event-loop backend (no
+      # epoll/eventfd). This proves the library compiles and links without
+      # those host-only dependencies. Tests/samples are disabled because they
+      # assume TLS and the epoll backend.
+      - name: Configure (portable backends)
+        run: |
+          cmake -S . -B build-portable -G Ninja \
+            -DCOMMON_LIB_C_TLS_BACKEND=NONE \
+            -DCOMMON_LIB_C_EVENT_LOOP_BACKEND=SELECT \
+            -DCOMMON_LIB_C_BUILD_TESTS=OFF \
+            -DHTTP_C_BUILD_TESTS=OFF \
+            -DHTTP_C_BUILD_SAMPLES=OFF \
+            -DHTTP_C_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build-portable -j"$(nproc)"
+

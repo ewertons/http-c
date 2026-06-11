@@ -4,7 +4,7 @@ add_executable(server_client_sample
     ${CMAKE_CURRENT_LIST_DIR}/main.c)
 
 target_link_libraries(server_client_sample
-    http
+    http-c
     common-lib-c
     ${OPENSSL_LIBRARIES}
     pthread)

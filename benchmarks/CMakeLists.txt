@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.16)
 
 # http-c bench server: links against the parent's http-c library.
 add_executable(http_c_bench sample_bench.c)
-target_link_libraries(http_c_bench PRIVATE http common-lib-c ${OPENSSL_LIBRARIES} pthread)
+target_link_libraries(http_c_bench PRIVATE http-c common-lib-c ${OPENSSL_LIBRARIES} pthread)
 
 # Mongoose bench: requires the mongoose source files to be present at
 # benchmarks/external/mongoose. run_bench.sh fetches them.

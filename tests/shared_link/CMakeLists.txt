@@ -22,10 +22,10 @@ project(${TARGET_NAME} LANGUAGES C)
 set(CMAKE_C_STANDARD 99)
 
 add_executable(${TARGET_NAME} consumer.c)
-target_link_libraries(${TARGET_NAME} http common-lib-c)
+target_link_libraries(${TARGET_NAME} http-c common-lib-c)
 
 # Embed an RPATH pointing at the build's library output dirs so that,
-# when BUILD_SHARED_LIBS=ON, the binary finds libhttp.so / libcommon-lib-c.so
+# when BUILD_SHARED_LIBS=ON, the binary finds libhttp-c.so / libcommon-lib-c.so
 # at runtime without the user having to set LD_LIBRARY_PATH.
 set_target_properties(${TARGET_NAME} PROPERTIES
     BUILD_WITH_INSTALL_RPATH FALSE

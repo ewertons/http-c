@@ -7,7 +7,7 @@
  *
  *   1. the public headers are self-contained (compile without dragging
  *      in OpenSSL or other backend headers),
- *   2. the symbols referenced below are exported by libhttp.so /
+ *   2. the symbols referenced below are exported by libhttp-c.so /
  *      libcommon-lib-c.so, and
  *   3. the binary runs successfully when the libraries are loaded as
  *      .so files via the dynamic linker (validated by simply executing

@@ -4,7 +4,7 @@ add_executable(streaming_sample
     ${CMAKE_CURRENT_LIST_DIR}/main.c)
 
 target_link_libraries(streaming_sample
-    http
+    http-c
     common-lib-c
     ${OPENSSL_LIBRARIES}
     pthread)

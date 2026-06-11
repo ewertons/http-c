@@ -23,7 +23,7 @@ add_executable(${TARGET_NAME}
                 test_http_server_storage.c
 )
 
-target_link_libraries(${TARGET_NAME} http common-lib-c cmocka pthread)
+target_link_libraries(${TARGET_NAME} http-c common-lib-c cmocka pthread)
 
 add_test(${TARGET_NAME} ${TARGET_NAME})
 

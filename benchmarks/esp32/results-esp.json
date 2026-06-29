@@ -1,0 +1,71 @@
+{
+  "label": "esp_http_server",
+  "base_free_heap": 224444,
+  "peak_min_free_heap": 193936,
+  "heap_used_under_load": 30508,
+  "best_rps": 58.5,
+  "best_conns": 8,
+  "cpu_us_per_req_est": 34188.0,
+  "sweep": [
+    {
+      "connections": 1,
+      "duration_s": 15.0,
+      "requests": 238,
+      "errors": 0,
+      "rps": 15.9,
+      "lat_avg_ms": 63.03,
+      "lat_p50_ms": 60.98,
+      "lat_p90_ms": 73.23,
+      "lat_p99_ms": 90.41,
+      "lat_max_ms": 173.3
+    },
+    {
+      "connections": 2,
+      "duration_s": 15.03,
+      "requests": 515,
+      "errors": 0,
+      "rps": 34.3,
+      "lat_avg_ms": 57.77,
+      "lat_p50_ms": 56.43,
+      "lat_p90_ms": 66.48,
+      "lat_p99_ms": 82.62,
+      "lat_max_ms": 97.34
+    },
+    {
+      "connections": 4,
+      "duration_s": 15.05,
+      "requests": 832,
+      "errors": 0,
+      "rps": 55.3,
+      "lat_avg_ms": 71.49,
+      "lat_p50_ms": 67.26,
+      "lat_p90_ms": 90.12,
+      "lat_p99_ms": 147.28,
+      "lat_max_ms": 180.61
+    },
+    {
+      "connections": 8,
+      "duration_s": 15.05,
+      "requests": 881,
+      "errors": 4,
+      "rps": 58.5,
+      "lat_avg_ms": 68.1,
+      "lat_p50_ms": 65.22,
+      "lat_p90_ms": 82.79,
+      "lat_p99_ms": 107.63,
+      "lat_max_ms": 137.11
+    },
+    {
+      "connections": 16,
+      "duration_s": 15.06,
+      "requests": 854,
+      "errors": 12,
+      "rps": 56.7,
+      "lat_avg_ms": 70.9,
+      "lat_p50_ms": 68.4,
+      "lat_p90_ms": 87.37,
+      "lat_p99_ms": 112.77,
+      "lat_max_ms": 150.29
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "bench_wifi.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        http-c
+        nvs_flash
+        esp_netif
+        esp_event
+        esp_timer
+        esp_wifi
+)

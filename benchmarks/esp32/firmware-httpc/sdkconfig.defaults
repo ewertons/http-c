@@ -1,0 +1,11 @@
+# Shared benchmark config — keep IDENTICAL between both firmwares.
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=6144
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# Fixed CPU frequency for repeatable CPU-per-request numbers.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Wi-Fi station. Set the password with: idf.py menuconfig -> Example Connection.
+CONFIG_EXAMPLE_CONNECT_WIFI=y
+CONFIG_EXAMPLE_WIFI_SSID="myssid"

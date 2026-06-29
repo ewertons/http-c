@@ -78,6 +78,32 @@ environment. On Linux, where a real epoll/SO_REUSEPORT kernel stack is
 available, lwIP's userspace TCP/IP stack adds latency rather than
 removing it; that is why no production Linux server uses it.
 
+## Embedded comparison (ESP32)
+
+The Linux numbers above measure framing/dispatch overhead on a desktop
+CPU. http-c is also designed for microcontrollers, so a separate
+benchmark pits it against ESP-IDF's built-in **esp_http_server** on real
+ESP32 hardware over Wi-Fi. Full methodology, per-connection sweeps and
+the ESP-IDF v6 compatibility notes are in
+[`esp32/REPORT.md`](esp32/REPORT.md).
+
+Headline results (ESP32 @240 MHz, plain HTTP, 4-connection cap,
+6-byte `GET /`):
+
+| Metric                   | http-c     | esp_http_server | Delta |
+|--------------------------|------------|-----------------|-------|
+| Best req/s               | **122.7**  | 58.5            | **2.10× http-c** |
+| Est. CPU µs/req          | **16,300** | 34,188          | **2.10× less http-c** |
+| Heap used under load (B) | **22,184** | 30,508          | **8.3 KB less http-c** |
+| Peak min-free heap (B)   | 134,988    | 193,936         | esp +59 KB |
+| App binary (B)           | **802,896**| 805,488         | http-c −2.6 KB |
+| p50 / p99 latency        | **31.5 / 63.9 ms** | 67.3 / 147.3 ms | http-c lower |
+
+On-device, http-c sustains ~2× the throughput at roughly half the CPU
+cost per request and uses ~8 KB less heap under load; esp_http_server
+keeps a larger absolute free-heap headroom because http-c statically
+embeds its connection and event-loop tables.
+
 ## Reproducing
 
 ```sh

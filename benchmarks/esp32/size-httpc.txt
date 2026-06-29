@@ -1,0 +1,33 @@
+Executing action: size
+Running ninja in directory /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build
+Executing "ninja all"...
+[1/4] cd /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build && /home/ewertons/.espressif/python_env/idf6.0_py3.12_env/bin/python /home/ewertons/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build/partition_table/partition-table.bin /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build/bench_httpc.bin
+bench_httpc.bin binary size 0xc57b0 bytes. Smallest app partition is 0x100000 bytes. 0x3a850 bytes (23%) free.
+[2/4] Performing build step for 'bootloader'
+[1/1] cd /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build/bootloader && /home/ewertons/.espressif/python_env/idf6.0_py3.12_env/bin/python /home/ewertons/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x1000 /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build/bootloader/bootloader.bin
+Bootloader binary size 0x65f0 bytes. 0xa10 bytes (9%) free.
+[3/4] No install step for 'bootloader'
+[4/4] Completed 'bootloader'
+Running ninja in directory /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build
+Executing "ninja size"...
+[0/1] cd /home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build && /usr/bin/cmake -D "IDF_SIZE_TOOL=/home/ewertons/.espressif/python_env/idf6.0_py3.12_env/bin/python;-m;esp_idf_size" -D MAP_FILE=/home/ewertons/code/s1/http-c-test/bench/firmware-httpc/build/bench_httpc.map -D OUTPUT_JSON= -P /home/ewertons/esp/esp-idf/tools/cmake/run_size_tool.cmake
+                             Memory Type Usage Summary                              
+┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Memory Type/Section   ┃ Used [bytes] ┃ Used [%] ┃ Remain [bytes] ┃ Total [bytes] ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ Flash Code            │       589594 │          │                │               │
+│    .text              │       589594 │          │                │               │
+│ Flash Data            │       113704 │          │                │               │
+│    .rodata            │       113432 │          │                │               │
+│    .appdesc           │          256 │          │                │               │
+│    .tdata             │           16 │          │                │               │
+│ IRAM                  │        87647 │    66.87 │          43425 │        131072 │
+│    .text              │        86619 │    66.09 │                │               │
+│    .vectors           │         1028 │     0.78 │                │               │
+│ DRAM                  │        49503 │    27.39 │         131233 │        180736 │
+│    .bss               │        31720 │    17.55 │                │               │
+│    .data              │        17783 │     9.84 │                │               │
+│ RTC SLOW              │           64 │     0.78 │           8128 │          8192 │
+│    .force_slow        │           40 │     0.49 │                │               │
+│    .rtc_slow_reserved │           24 │     0.29 │                │               │
+└───────────────────────┴──────────────┴──────────┴────────────────┴───────────────┘

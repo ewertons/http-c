@@ -104,6 +104,26 @@ cost per request and uses ~8 KB less heap under load; esp_http_server
 keeps a larger absolute free-heap headroom because http-c statically
 embeds its connection and event-loop tables.
 
+### Conclusion
+
+The only dimension where http-c is "worse" is its upfront static memory
+footprint — and that is a deliberate design tradeoff, not inefficiency:
+
+- **Idle free-heap headroom (http-c's one downside):** http-c leaves
+  ~157 KB free at boot vs esp_http_server's ~224 KB, and ~135 KB vs
+  ~194 KB peak-min-free. That ~60 KB gap is http-c reserving its
+  connection slots and the ~20 KB event-loop table up front.
+- **Heap used *under load* (incremental):** http-c actually uses **less**
+  — 22.2 KB vs 30.5 KB — because it allocates nothing per request, while
+  esp_http_server grows its footprint once traffic arrives.
+
+Everywhere else http-c wins: ~2.1× throughput, ~half the CPU per request,
+lower latency at every percentile, and a marginally smaller binary. The
+preallocation is precisely what delivers the deterministic, zero-alloc
+request path behind those latency and CPU numbers. In short: http-c
+trades a fixed slice of idle free heap for predictability and speed, and
+comes out ahead on virtually every runtime metric.
+
 ## Reproducing
 
 ```sh

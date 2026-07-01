@@ -41,6 +41,7 @@
 #define PORT_KEEP_ALIVE      4406
 #define PORT_PARALLEL        4407
 #define PORT_PLAIN_HTTP      4408
+#define PORT_STREAM_BODY     4409
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -830,6 +831,129 @@ static void http_server_plain_http_GET_request_succeed(void** state)
     handler_capture_destroy(&handler);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Streaming response body (http_body_provider_t). A handler streams a payload
+ * larger than the send buffer; the server must pull it in multiple chunks and
+ * invoke the finalizer exactly once.
+ * ------------------------------------------------------------------------- */
+#define STREAM_BODY_SIZE 20000u
+
+typedef struct stream_ctx
+{
+    const uint8_t* payload;
+    uint32_t       size;
+    uint32_t       offset;
+    uint32_t       provider_calls;   /* calls that returned > 0 */
+    uint32_t       bytes_sent;       /* total bytes handed to the server */
+    uint32_t       finalize_calls;
+    uint8_t        hdr_buf[64];
+    uint8_t        clen[16];
+} stream_ctx_t;
+
+static uint8_t s_stream_payload[STREAM_BODY_SIZE];
+
+static uint32_t stream_provider(void* context, uint8_t* buffer, uint32_t buffer_size)
+{
+    stream_ctx_t* c = (stream_ctx_t*)context;
+    uint32_t remaining = c->size - c->offset;
+    if (remaining == 0) return 0;                       /* true EOF */
+    uint32_t n = (remaining < buffer_size) ? remaining : buffer_size;
+    memcpy(buffer, c->payload + c->offset, n);
+    c->offset     += n;
+    c->bytes_sent += n;
+    c->provider_calls++;
+    return n;
+}
+
+static void stream_finalizer(void* context)
+{
+    stream_ctx_t* c = (stream_ctx_t*)context;
+    c->finalize_calls++;
+}
+
+static void streaming_handler(http_request_t* request,
+                              span_t* path_matches,
+                              uint16_t number_of_matches,
+                              http_response_t* out_response,
+                              void* user_context)
+{
+    (void)request; (void)path_matches; (void)number_of_matches;
+    stream_ctx_t* c = (stream_ctx_t*)user_context;
+
+    /* The streaming contract requires the handler to set Content-Length. */
+    (void)http_headers_init(&out_response->headers,
+                            span_init(c->hdr_buf, sizeof(c->hdr_buf)));
+    span_t cl = span_copy_int32(span_init(c->clen, sizeof(c->clen)),
+                                (int32_t)c->size, NULL);
+    (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_LENGTH, cl);
+
+    out_response->code                  = HTTP_CODE_200;
+    out_response->reason_phrase         = HTTP_REASON_PHRASE_200;
+    out_response->body_provider         = stream_provider;
+    out_response->body_finalizer        = stream_finalizer;
+    out_response->body_provider_context = c;
+}
+
+static void http_server_streams_large_body_succeed(void** state)
+{
+    (void)state;
+
+    for (uint32_t i = 0; i < STREAM_BODY_SIZE; i++)
+    {
+        s_stream_payload[i] = (uint8_t)('A' + (i % 26));
+    }
+
+    stream_ctx_t ctx;
+    (void)memset(&ctx, 0, sizeof(ctx));
+    ctx.payload = s_stream_payload;
+    ctx.size    = STREAM_BODY_SIZE;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_STREAM_BODY);
+
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/stream$"),
+                                           streaming_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_STREAM_BODY);
+
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/stream"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true /* Connection: close */);
+
+    /* The shared 2 KB client buffer is too small for a 20 KB body — use a
+     * local receive buffer big enough for the head + streamed body. */
+    static uint8_t recv_buf[STREAM_BODY_SIZE + 512];
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      span_init(recv_buf, sizeof(recv_buf)),
+                                                      &response, NULL),
+                     ok);
+
+    assert_int_equal(span_compare(response.code, HTTP_CODE_200), 0);
+    assert_int_equal(span_get_size(response.body), STREAM_BODY_SIZE);
+    assert_memory_equal(span_get_ptr(response.body), s_stream_payload, STREAM_BODY_SIZE);
+
+    client_disconnect(&client);
+
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+
+    /* Delivered in multiple chunks (20 KB over an 8 KB send buffer) and the
+     * finalizer ran exactly once. */
+    assert_int_equal(ctx.bytes_sent, STREAM_BODY_SIZE);
+    assert_true(ctx.provider_calls >= 3);
+    assert_int_equal(ctx.finalize_calls, 1);
+}
+
 /* ------------------------------------------------------------------------- */
 
 int test_http_server()
@@ -860,6 +984,7 @@ int test_http_server()
         cmocka_unit_test(http_server_keep_alive_multiple_requests_succeed),
         cmocka_unit_test(http_server_handles_parallel_clients_succeed),
         cmocka_unit_test(http_server_plain_http_GET_request_succeed),
+        cmocka_unit_test(http_server_streams_large_body_succeed),
     };
 
     return cmocka_run_group_tests_name("http_server", tests, NULL, NULL);

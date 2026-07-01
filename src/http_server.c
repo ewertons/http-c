@@ -30,6 +30,7 @@ static void slot_close        (http_server_connection_slot_t* slot);
 static void slot_advance      (http_server_connection_slot_t* slot);
 static void slot_arm          (http_server_connection_slot_t* slot, uint32_t events);
 static void slot_drive_handshake(http_server_connection_slot_t* slot);
+static void stream_finalize   (http_server_connection_slot_t* slot);
 static void run_handler_and_serialize(http_server_connection_slot_t* slot,
                                       http_request_t*               request);
 
@@ -84,6 +85,11 @@ static http_server_connection_slot_t* acquire_slot(http_server_t* server)
             slot->registered_events  = 0;
             slot->keep_alive         = false;
             slot->client_wants_close = false;
+            slot->stream_active      = false;
+            slot->stream_eof         = false;
+            slot->stream_provider    = NULL;
+            slot->stream_finalizer   = NULL;
+            slot->stream_ctx         = NULL;
             (void)memset(&slot->connection, 0, sizeof(slot->connection));
             return slot;
         }
@@ -212,8 +218,28 @@ static void slot_arm(http_server_connection_slot_t* slot, uint32_t events)
     }
 }
 
+/* Invoke the streaming finalizer (if any) exactly once, releasing handler
+ * resources tied to a streamed body. Safe to call on any teardown path. */
+static void stream_finalize(http_server_connection_slot_t* slot)
+{
+    if (slot->stream_active)
+    {
+        slot->stream_active = false;   /* clear first: finalizer must run once */
+        if (slot->stream_finalizer != NULL)
+        {
+            slot->stream_finalizer(slot->stream_ctx);
+        }
+        slot->stream_eof       = false;
+        slot->stream_provider  = NULL;
+        slot->stream_finalizer = NULL;
+        slot->stream_ctx       = NULL;
+    }
+}
+
 static void slot_close(http_server_connection_slot_t* slot)
 {
+    stream_finalize(slot);
+
     int fd = slot->connection.socket.sd;
     if (slot->registered_events != 0 && fd >= 0)
     {
@@ -375,6 +401,20 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
         prepare_default_response(&response, HTTP_CODE_405, HTTP_REASON_PHRASE_405);
     }
 
+    /* If the handler supplied a streaming body, remember it on the slot and
+     * serialise only the head (status line + headers). The body is then
+     * pulled from the provider as the send buffer drains. The handler is
+     * responsible for setting a correct Content-Length header. */
+    if (response.body_provider != NULL)
+    {
+        slot->stream_active    = true;
+        slot->stream_eof       = false;
+        slot->stream_provider  = response.body_provider;
+        slot->stream_finalizer = response.body_finalizer;
+        slot->stream_ctx       = response.body_provider_context;
+        response.body          = SPAN_EMPTY;
+    }
+
     /* Serialise into the send buffer. */
     buffer_stream_t bs = {
         .ptr        = slot->send_buffer_ptr,
@@ -454,26 +494,47 @@ static void slot_finish_send(http_server_connection_slot_t* slot)
 
 static void slot_drive_send(http_server_connection_slot_t* slot)
 {
-    while (slot->send_offset < slot->send_used)
+    for (;;)
     {
-        span_t to_send = span_init(slot->send_buffer_ptr + slot->send_offset,
-                                   slot->send_used - slot->send_offset);
-        uint32_t written = 0;
-        result_t r = socket_write_nb(&slot->connection.socket, to_send, &written);
-        slot->send_offset += written;
+        while (slot->send_offset < slot->send_used)
+        {
+            span_t to_send = span_init(slot->send_buffer_ptr + slot->send_offset,
+                                       slot->send_used - slot->send_offset);
+            uint32_t written = 0;
+            result_t r = socket_write_nb(&slot->connection.socket, to_send, &written);
+            slot->send_offset += written;
 
-        if (r == ok)
-        {
-            break;
-        }
-        if (r == try_again)
-        {
-            slot_arm(slot,
-                     want_to_events(socket_get_io_want(&slot->connection.socket)));
+            if (r == ok)
+            {
+                break;
+            }
+            if (r == try_again)
+            {
+                slot_arm(slot,
+                         want_to_events(socket_get_io_want(&slot->connection.socket)));
+                return;
+            }
+            slot_close(slot);
             return;
         }
-        slot_close(slot);
-        return;
+
+        /* Send buffer drained. If a streaming body is active, pull the next
+         * chunk from the provider and keep sending; otherwise we're done. */
+        if (slot->stream_active && !slot->stream_eof)
+        {
+            uint32_t n = slot->stream_provider(slot->stream_ctx,
+                                               slot->send_buffer_ptr,
+                                               slot->send_buffer_size);
+            if (n > 0)
+            {
+                slot->send_used   = n;
+                slot->send_offset = 0;
+                continue;
+            }
+            slot->stream_eof = true;
+            stream_finalize(slot);
+        }
+        break;
     }
 
     slot_finish_send(slot);
@@ -757,6 +818,7 @@ result_t http_server_run(http_server_t* server)
         http_server_connection_slot_t* slot = &server->storage->slots[i];
         if (slot->in_use)
         {
+            stream_finalize(slot);
             int sd = slot->connection.socket.sd;
             if (slot->registered_events != 0 && sd >= 0)
             {

@@ -100,6 +100,15 @@ typedef struct http_server_connection_slot
     uint32_t              registered_events; /* event mask currently registered */
     bool                  keep_alive;
     bool                  client_wants_close;
+
+    /* Optional streaming body. Active between the serialised head being
+     * flushed and the provider reporting end-of-body. See http_response_t
+     * (body_provider / body_finalizer). */
+    bool                  stream_active;
+    bool                  stream_eof;
+    http_body_provider_t  stream_provider;
+    http_body_finalizer_t stream_finalizer;
+    void*                 stream_ctx;
 } http_server_connection_slot_t;
 
 /* Caller-supplied storage. The library treats `slots` and `routes` as

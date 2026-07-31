@@ -6,6 +6,40 @@
 #include <span.h>
 #include "niceties.h"
 
+/* Headers are *written* as "Name: value" but must be *read* far more
+ * leniently. RFC 7230 3.2 puts the colon immediately after the name and
+ * makes the whitespace around the value optional, so "Content-Length:42"
+ * and "Content-Length:  42  " are both legal and both have to parse. */
+static const span_t header_name_terminator = span_from_str_literal(":");
+
+/* RFC 7230 3.2.3: optional whitespace either side of a field value is not
+ * part of the value. Spaces and horizontal tabs only -- a CR or LF here
+ * would mean the header block was framed wrongly, which is not something
+ * to paper over. */
+static span_t trim_optional_whitespace(span_t value)
+{
+    uint32_t size = span_get_size(value);
+
+    if (value.ptr == NULL || size == 0)
+    {
+        return value;
+    }
+
+    uint32_t start = 0;
+    uint32_t end   = size;
+
+    while (start < end && (value.ptr[start] == ' ' || value.ptr[start] == '\t'))
+    {
+        start++;
+    }
+    while (end > start && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t'))
+    {
+        end--;
+    }
+
+    return span_slice(value, start, end - start);
+}
+
 
 HL_RESULT http_headers_init(http_headers_t* headers, span_t buffer)
 {
@@ -162,14 +196,22 @@ HL_RESULT http_headers_find(http_headers_t* headers, span_t name, span_t* value)
         {
             span_t current_header_name, current_header_value;
 
-            if (span_split(current_header, 0, name_value_separator, &current_header_name, &current_header_value) != 0)
+            if (span_split(current_header, 0, header_name_terminator, &current_header_name, &current_header_value) != 0)
             {
-                result = HL_RESULT_ERROR;
+                /* No colon at all, so this is not a header. Skipping it
+                 * rather than failing the lookup keeps one malformed line
+                 * from hiding every header after it. */
+                continue;
             }
-            else if (span_compare(current_header_name, name) == 0)
+            /* Field names are case-insensitive (RFC 7230 3.2). Comparing
+             * them byte-exact is why a client sending "content-length"
+             * had its body silently discarded: the length was never
+             * found, so the parser waited for zero body bytes and handed
+             * the handler an empty span. */
+            else if (span_icompare(current_header_name, name, true) == 0)
             {
                 result = HL_RESULT_OK;
-                *value = current_header_value;
+                *value = trim_optional_whitespace(current_header_value);
                 break;
             }
         }
@@ -229,7 +271,11 @@ result_t http_headers_serialize_to(http_headers_t* headers, stream_t* stream)
     {
         if (headers->used_size == 0)
         {
-            result = stream_write(stream, crlf, NULL);
+            /* Nothing, not a CRLF. Both callers -- the request and the
+             * response serialisers -- write the blank line that ends the
+             * header block themselves, so emitting one here as well put a
+             * stray CRLF into the body of every header-less message. */
+            result = ok;
         }
         else 
         {

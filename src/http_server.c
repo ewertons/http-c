@@ -39,6 +39,7 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
  * ------------------------------------------------------------------------- */
 static const span_t HDR_CONNECTION = span_from_str_literal("Connection");
 static const span_t HDR_VAL_CLOSE  = span_from_str_literal("close");
+static const span_t HDR_VAL_ZERO   = span_from_str_literal("0");
 
 static http_server_state_t server_get_state(http_server_t* server)
 {
@@ -144,7 +145,11 @@ static bool client_wants_close(http_request_t* request)
     span_t value;
     if (http_headers_find(&request->headers, HDR_CONNECTION, &value) == HL_RESULT_OK)
     {
-        if (span_compare(value, HDR_VAL_CLOSE) == 0)
+        /* The connection option is a case-insensitive token (RFC 7230
+         * 6.1), and "Close" is as valid as "close". Comparing it
+         * byte-exact left the slot open against a client that had said
+         * it was leaving, which is a slot leaked per request. */
+        if (span_icompare(value, HDR_VAL_CLOSE, true) == 0)
         {
             return true;
         }
@@ -399,6 +404,21 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
     else if (!method_matched && server->route_count > 0)
     {
         prepare_default_response(&response, HTTP_CODE_405, HTTP_REASON_PHRASE_405);
+    }
+
+    /* Everything the server answers on its own behalf has an empty body
+     * and, until now, no headers whatsoever -- which is not "a response
+     * with no body" on the wire, it is a response whose body ends when
+     * the connection does (RFC 7230 3.3.3). A keep-alive client therefore
+     * sat waiting on a 404 until it timed out. A handler's response is
+     * left alone: it owns its own header buffer and its own framing. */
+    if (!route_matched)
+    {
+        response.headers.buffer    = span_init(slot->default_headers,
+                                               (uint32_t)sizeof(slot->default_headers));
+        response.headers.used_size = 0;
+        response.headers.iterator  = SPAN_EMPTY;
+        (void)http_headers_add(&response.headers, HTTP_HEADER_CONTENT_LENGTH, HDR_VAL_ZERO);
     }
 
     /* If the handler supplied a streaming body, remember it on the slot and

@@ -59,6 +59,113 @@ static void parser_completes_post_with_body(void** state)
     assert_int_equal(http_request_parser_get_consumed(&p), strlen(msg));
 }
 
+/* The body bug, at the layer it actually bit. Every other test in this
+ * file spells the header exactly the way http-c writes it, so none of
+ * them could ever have caught this: a client sending the header
+ * lowercased -- which node, Playwright and every HTTP/2 client do -- had
+ * its Content-Length missed, so the parser concluded the body was zero
+ * bytes long and completed the request with an empty one. The handler saw
+ * a well-formed request with nothing in it. */
+static void parser_reads_lowercase_content_length(void** state)
+{
+    (void)state;
+    http_request_parser_t p;
+    http_request_parser_init(&p);
+
+    const char* msg =
+        "POST /api HTTP/1.1\r\n"
+        "host: x\r\n"
+        "content-type: application/json\r\n"
+        "content-length: 5\r\n"
+        "\r\n"
+        "hello";
+
+    assert_int_equal(feed_literal(&p, msg), ok);
+    assert_int_equal(http_request_parser_get_state(&p),
+                     http_request_parser_state_complete);
+
+    http_request_t* req = http_request_parser_get_request(&p);
+    assert_int_equal(span_compare(req->body, span_from_str_literal("hello")), 0);
+    assert_int_equal(http_request_parser_get_consumed(&p), strlen(msg));
+}
+
+/* Same failure, different spelling: the separator is a colon, and the
+ * space after it is optional. */
+static void parser_reads_content_length_without_space(void** state)
+{
+    (void)state;
+    http_request_parser_t p;
+    http_request_parser_init(&p);
+
+    const char* msg =
+        "POST /api HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Content-Length:5\r\n"
+        "\r\n"
+        "hello";
+
+    assert_int_equal(feed_literal(&p, msg), ok);
+    assert_int_equal(http_request_parser_get_state(&p),
+                     http_request_parser_state_complete);
+    assert_int_equal(span_compare(http_request_parser_get_request(&p)->body,
+                                  span_from_str_literal("hello")), 0);
+}
+
+/* A lowercase header must not only be found, it must be *waited for*.
+ * Getting this wrong is what made the request look complete the moment
+ * the head arrived, which is the same defect seen from the other side. */
+static void parser_waits_for_body_named_by_lowercase_header(void** state)
+{
+    (void)state;
+    http_request_parser_t p;
+    http_request_parser_init(&p);
+
+    assert_int_equal(feed_literal(&p,
+        "POST /api HTTP/1.1\r\ncontent-length: 5\r\n\r\n"), try_again);
+    assert_int_equal(http_request_parser_get_state(&p),
+                     http_request_parser_state_body);
+
+    assert_int_equal(feed_literal(&p,
+        "POST /api HTTP/1.1\r\ncontent-length: 5\r\n\r\nhel"), try_again);
+
+    assert_int_equal(feed_literal(&p,
+        "POST /api HTTP/1.1\r\ncontent-length: 5\r\n\r\nhello"), ok);
+    assert_int_equal(span_compare(http_request_parser_get_request(&p)->body,
+                                  span_from_str_literal("hello")), 0);
+}
+
+/* This parser frames a body by Content-Length and nothing else, so a
+ * chunked request has to be refused rather than read as a body-less one.
+ * Accepting it would leave the chunks in the buffer and the keep-alive
+ * path would parse them as the client's next request -- which is how a
+ * request gets smuggled inside a body. */
+static void parser_rejects_chunked_transfer_encoding(void** state)
+{
+    (void)state;
+    http_request_parser_t p;
+    http_request_parser_init(&p);
+
+    assert_int_equal(feed_literal(&p,
+        "POST /api HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\nhello\r\n0\r\n\r\n"), error);
+    assert_int_equal(http_request_parser_get_state(&p),
+                     http_request_parser_state_error);
+}
+
+/* Refused however it is spelled, or the check is worth nothing. */
+static void parser_rejects_lowercase_transfer_encoding(void** state)
+{
+    (void)state;
+    http_request_parser_t p;
+    http_request_parser_init(&p);
+
+    assert_int_equal(feed_literal(&p,
+        "POST /api HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n"), error);
+}
+
 static void parser_handles_byte_at_a_time(void** state)
 {
     (void)state;
@@ -156,6 +263,11 @@ int test_http_request_parser()
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(parser_completes_simple_get),
         cmocka_unit_test(parser_completes_post_with_body),
+        cmocka_unit_test(parser_reads_lowercase_content_length),
+        cmocka_unit_test(parser_reads_content_length_without_space),
+        cmocka_unit_test(parser_waits_for_body_named_by_lowercase_header),
+        cmocka_unit_test(parser_rejects_chunked_transfer_encoding),
+        cmocka_unit_test(parser_rejects_lowercase_transfer_encoding),
         cmocka_unit_test(parser_handles_byte_at_a_time),
         cmocka_unit_test(parser_returns_try_again_when_body_truncated),
         cmocka_unit_test(parser_init_with_null_does_not_crash),

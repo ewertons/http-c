@@ -141,10 +141,28 @@ static void send_simple_request(test_client_t* client,
     assert_int_equal(http_connection_send_request(&client->connection, &request), ok);
 }
 
+/* The responses the server writes for itself -- 404 and 405 -- have no
+ * handler to give them a Content-Length, and a response carrying neither
+ * that nor a Transfer-Encoding is delimited by the connection closing
+ * (RFC 7230 3.3.3). Sent to a keep-alive client, one of those is a reply
+ * the client cannot tell is over: `curl` against an unmatched route sat
+ * waiting until it was interrupted. The header block was also terminated
+ * twice, so two stray CRLF bytes led the body.
+ *
+ * Both are cheap to assert and neither was covered. */
+static void assert_default_response_is_framed(http_response_t* response)
+{
+    span_t length;
+    assert_int_equal(http_headers_find(&response->headers,
+                                       HTTP_HEADER_CONTENT_LENGTH, &length),
+                     HL_RESULT_OK);
+    assert_int_equal(span_compare(length, span_from_str_literal("0")), 0);
+    assert_true(span_is_empty(response->body));
+}
+
 /* Synchronization between handler invocation and the test driver. */
 typedef struct handler_capture
-{
-    pthread_mutex_t mutex;
+{    pthread_mutex_t mutex;
     pthread_cond_t  cond;
     bool            invoked;
     span_t          method;
@@ -605,6 +623,7 @@ static void http_server_returns_404_for_unknown_path(void** state)
     assert_int_equal(span_compare(response.code, HTTP_CODE_404), 0);
     assert_int_equal(span_compare(response.reason_phrase, HTTP_REASON_PHRASE_404), 0);
     assert_false(handler.invoked);
+    assert_default_response_is_framed(&response);
 
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
@@ -648,6 +667,7 @@ static void http_server_returns_405_for_method_mismatch(void** state)
                      ok);
     assert_int_equal(span_compare(response.code, HTTP_CODE_405), 0);
     assert_int_equal(span_compare(response.reason_phrase, HTTP_REASON_PHRASE_405), 0);
+    assert_default_response_is_framed(&response);
     assert_false(handler.invoked);
 
     client_disconnect(&client);

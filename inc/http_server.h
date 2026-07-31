@@ -101,6 +101,18 @@ typedef struct http_server_connection_slot
     bool                  keep_alive;
     bool                  client_wants_close;
 
+    /* Header storage for the responses the server generates itself (404,
+     * 405). A handler brings its own buffer; these have no handler, and
+     * without somewhere to write "Content-Length: 0" they go out with no
+     * framing at all -- which RFC 7230 3.3.3 says means "body ends when
+     * the connection closes", so a keep-alive client waits for a body
+     * that is never coming.
+     *
+     * 32 bytes because that header is 19 of them and this is per slot on
+     * a library that never allocates: on the microcontroller storage it
+     * is four slots, so the whole fix costs 128 bytes of static RAM. */
+    uint8_t               default_headers[32];
+
     /* Optional streaming body. Active between the serialised head being
      * flushed and the provider reporting end-of-body. See http_response_t
      * (body_provider / body_finalizer). */

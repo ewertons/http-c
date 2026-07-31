@@ -71,6 +71,20 @@ static result_t parse_head(http_request_parser_t* parser, span_t buffer,
         parser->has_content_length = true;
     }
 
+    /* A chunked request is refused rather than misread. This parser frames
+     * a body by Content-Length alone, so a Transfer-Encoding it ignores
+     * would leave the head looking complete and the chunked body sitting
+     * in the buffer -- where the keep-alive path would hand it to the next
+     * parse as though the client had pipelined it. That is exactly the
+     * shape of a smuggled request, and answering nothing is the only safe
+     * reading of a framing this code does not implement. */
+    span_t te_value;
+    if (http_headers_find(&parser->request.headers,
+                          HTTP_HEADER_TRANSFER_ENCODING, &te_value) == HL_RESULT_OK)
+    {
+        return error;
+    }
+
     parser->headers_end = headers_end;
     return ok;
 }

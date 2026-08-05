@@ -1416,6 +1416,9 @@ static void http_server_oversize_request_returns_413(void** state)
                                                       client_buffer(&client),
                                                       &response, NULL), ok);
     assert_int_equal(span_compare(response.code, HTTP_CODE_413), 0);
+    /* Framed, not connection-delimited: an unframed error leaves a
+     * keep-alive client waiting for a terminator that never comes. */
+    assert_default_response_is_framed(&response);
     assert_false(handler.invoked);
 
     client_disconnect(&client);

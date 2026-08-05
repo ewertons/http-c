@@ -261,6 +261,25 @@ static uint8_t  s_media_headers_buf[256];
 static char     s_media_clen_buf[16];
 static char     s_media_crange_buf[64];
 
+/* A response carrying neither Content-Length nor Transfer-Encoding is
+ * delimited by the connection closing (RFC 7230 3.3.3), so a keep-alive
+ * client waits for a terminator that never arrives. The server frames the
+ * responses it generates itself, but a handler owns framing for its own --
+ * including the error paths, which is easy to forget precisely because
+ * they carry no body. */
+static bool frame_empty_response(http_response_t* out_response,
+                                 uint8_t*         buffer,
+                                 uint32_t         size)
+{
+    if (http_headers_init(&out_response->headers, span_init(buffer, size)) != HL_RESULT_OK)
+    {
+        return false;
+    }
+    return http_headers_add(&out_response->headers,
+                            HTTP_HEADER_CONTENT_LENGTH,
+                            span_from_str_literal("0")) == HL_RESULT_OK;
+}
+
 static http_handler_outcome_t media_handler(http_exchange_t* exchange, void* user_context)
 {
     http_request_t*  request      = http_exchange_request(exchange);
@@ -271,9 +290,15 @@ static http_handler_outcome_t media_handler(http_exchange_t* exchange, void* use
     {
         /* Nothing to serve. The old code returned here and commented that
          * it was "falling through to 404" -- but the pre-filled response
-         * is 200, so it actually shipped an empty 200. Now it says 404. */
+         * is 200, so it actually shipped an empty 200. Now it says 404,
+         * framed so a keep-alive client knows the body is empty. */
         out_response->code          = HTTP_CODE_404;
         out_response->reason_phrase = HTTP_REASON_PHRASE_404;
+        if (!frame_empty_response(out_response, s_media_headers_buf,
+                                  (uint32_t)sizeof(s_media_headers_buf)))
+        {
+            return http_handler_close;
+        }
         return http_handler_respond;
     }
 
@@ -311,6 +336,11 @@ static http_handler_outcome_t media_handler(http_exchange_t* exchange, void* use
     {
         out_response->code          = HTTP_CODE_500;
         out_response->reason_phrase = HTTP_REASON_PHRASE_500;
+        if (!frame_empty_response(out_response, s_media_headers_buf,
+                                  (uint32_t)sizeof(s_media_headers_buf)))
+        {
+            return http_handler_close;
+        }
         return http_handler_respond;
     }
     span_t crange_span = span_init((uint8_t*)s_media_crange_buf, (uint32_t)crange_n);

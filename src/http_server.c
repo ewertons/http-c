@@ -33,6 +33,10 @@ static void slot_drive_handshake(http_server_connection_slot_t* slot);
 static void stream_finalize   (http_server_connection_slot_t* slot);
 static void run_handler_and_serialize(http_server_connection_slot_t* slot,
                                       http_request_t*               request);
+static void serialize_and_send(http_server_connection_slot_t* slot,
+                               http_response_t*              response);
+static void respond_with_status(http_server_connection_slot_t* slot,
+                                span_t code, span_t reason);
 
 /* ------------------------------------------------------------------------- *
  * Internal helpers.
@@ -40,6 +44,19 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
 static const span_t HDR_CONNECTION = span_from_str_literal("Connection");
 static const span_t HDR_VAL_CLOSE  = span_from_str_literal("close");
 static const span_t HDR_VAL_ZERO   = span_from_str_literal("0");
+
+/* Monotonic milliseconds. CLOCK_MONOTONIC rather than CLOCK_REALTIME so a
+ * wall-clock adjustment cannot make a deferral deadline fire early or
+ * never. */
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
 
 static http_server_state_t server_get_state(http_server_t* server)
 {
@@ -91,6 +108,11 @@ static http_server_connection_slot_t* acquire_slot(http_server_t* server)
             slot->stream_provider    = NULL;
             slot->stream_finalizer   = NULL;
             slot->stream_ctx         = NULL;
+            /* NB: `generation` is deliberately not reset here -- it must
+             * keep advancing across reuses for handle validation to mean
+             * anything. */
+            slot->pending_ready       = false;
+            slot->pending_deadline_ms = 0;
             (void)memset(&slot->connection, 0, sizeof(slot->connection));
             return slot;
         }
@@ -101,8 +123,24 @@ static http_server_connection_slot_t* acquire_slot(http_server_t* server)
 static void release_slot(http_server_connection_slot_t* slot)
 {
     http_server_t* server = slot->server;
-    slot->in_use            = false;
-    slot->state             = http_slot_state_idle;
+
+    /* Bumping the generation under the lock is what invalidates a
+     * deferral handle still held by a worker thread: its next
+     * http_server_respond sees the mismatch and gets not_found, instead
+     * of writing a response into whatever connection reuses this slot. */
+    if (server != NULL)
+    {
+        (void)pthread_mutex_lock(&server->pending_mutex);
+    }
+    slot->in_use        = false;
+    slot->state         = http_slot_state_idle;
+    slot->pending_ready = false;
+    slot->generation++;
+    if (server != NULL)
+    {
+        (void)pthread_mutex_unlock(&server->pending_mutex);
+    }
+
     slot->recv_used         = 0;
     slot->send_used         = 0;
     slot->send_offset       = 0;
@@ -307,8 +345,13 @@ static void slot_drive_receive(http_server_connection_slot_t* slot)
     {
         if (slot->recv_used >= slot->recv_buffer_size)
         {
-            log_error("recv buffer full (%u bytes), closing", slot->recv_used);
-            slot_close(slot);
+            /* The request does not fit this slot's receive buffer.
+             * Dropping the connection (the previous behaviour) surfaces in
+             * a browser as an unexplained network error with nothing to
+             * diagnose, so say what actually happened, then close. */
+            log_error("recv buffer full (%u bytes), replying 413", slot->recv_used);
+            slot->client_wants_close = true;
+            respond_with_status(slot, HTTP_CODE_413, HTTP_REASON_PHRASE_413);
             return;
         }
 
@@ -390,6 +433,10 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
         if (mr == ok)
         {
             prepare_default_response(&response, HTTP_CODE_200, HTTP_REASON_PHRASE_200);
+            /* Hand the handler its deferral ticket. Must come after
+             * prepare_default_response, which zeroes the struct. */
+            response.deferral.slot       = slot;
+            response.deferral.generation = slot->generation;
             route->handler(request, path_matches, number_of_matches,
                            &response, route->user_context);
             route_matched = true;
@@ -421,18 +468,42 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
         (void)http_headers_add(&response.headers, HTTP_HEADER_CONTENT_LENGTH, HDR_VAL_ZERO);
     }
 
+    /* The handler chose to answer later, so there is nothing to
+     * serialise yet. Park the connection. Read interest stays armed so a
+     * peer that goes away is noticed immediately instead of at the
+     * deferral deadline. */
+    if (response.deferred)
+    {
+        (void)pthread_mutex_lock(&server->pending_mutex);
+        slot->pending_ready       = false;
+        slot->pending_deadline_ms = now_ms() + (uint64_t)server->pending_timeout_ms;
+        slot->state               = http_slot_state_pending;
+        (void)pthread_mutex_unlock(&server->pending_mutex);
+        slot_arm(slot, event_loop_event_read);
+        return;
+    }
+
+    serialize_and_send(slot, &response);
+}
+
+/* Serialise `response` into the slot's send buffer and start writing.
+ * Shared by the immediate path, the deferred-completion path, and the
+ * responses the server generates on its own behalf. */
+static void serialize_and_send(http_server_connection_slot_t* slot,
+                               http_response_t*              response)
+{
     /* If the handler supplied a streaming body, remember it on the slot and
      * serialise only the head (status line + headers). The body is then
      * pulled from the provider as the send buffer drains. The handler is
      * responsible for setting a correct Content-Length header. */
-    if (response.body_provider != NULL)
+    if (response->body_provider != NULL)
     {
         slot->stream_active    = true;
         slot->stream_eof       = false;
-        slot->stream_provider  = response.body_provider;
-        slot->stream_finalizer = response.body_finalizer;
-        slot->stream_ctx       = response.body_provider_context;
-        response.body          = SPAN_EMPTY;
+        slot->stream_provider  = response->body_provider;
+        slot->stream_finalizer = response->body_finalizer;
+        slot->stream_ctx       = response->body_provider_context;
+        response->body         = SPAN_EMPTY;
     }
 
     /* Serialise into the send buffer. */
@@ -450,7 +521,7 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
         .inner_stream = (void*)&bs,
     };
 
-    if (is_error(http_response_serialize_to(&response, &st)) || bs.overflowed)
+    if (is_error(http_response_serialize_to(response, &st)) || bs.overflowed)
     {
         log_error("response serialise failed (overflow=%d)", bs.overflowed);
         slot_close(slot);
@@ -461,6 +532,22 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
     slot->send_offset = 0;
     slot->state       = http_slot_state_sending;
     slot_arm(slot, event_loop_event_write);
+}
+
+/* Answer with a bare status line the server produces itself (no handler
+ * involved), borrowing the slot's small default header buffer so the
+ * response is properly framed rather than body-ends-at-close. */
+static void respond_with_status(http_server_connection_slot_t* slot,
+                                span_t code, span_t reason)
+{
+    http_response_t response;
+    prepare_default_response(&response, code, reason);
+    response.headers.buffer    = span_init(slot->default_headers,
+                                           (uint32_t)sizeof(slot->default_headers));
+    response.headers.used_size = 0;
+    response.headers.iterator  = SPAN_EMPTY;
+    (void)http_headers_add(&response.headers, HTTP_HEADER_CONTENT_LENGTH, HDR_VAL_ZERO);
+    serialize_and_send(slot, &response);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -563,12 +650,49 @@ static void slot_drive_send(http_server_connection_slot_t* slot)
 /* ------------------------------------------------------------------------- *
  * Per-connection event dispatcher.
  * ------------------------------------------------------------------------- */
+/* Parked awaiting a deferred response. Read interest stays armed purely to
+ * notice the peer leaving, so a closed browser tab frees its slot at once
+ * rather than lingering until the deferral deadline. */
+static void slot_probe_pending(http_server_connection_slot_t* slot)
+{
+    if (slot->recv_used >= slot->recv_buffer_size)
+    {
+        /* Nowhere to put more bytes. Not fatal -- wait for the response
+         * or the deadline rather than dropping a peer that is still
+         * there. */
+        return;
+    }
+
+    uint32_t got = 0;
+    result_t rr  = socket_read_nb(&slot->connection.socket,
+                                  slot->recv_buffer_ptr + slot->recv_used,
+                                  slot->recv_buffer_size - slot->recv_used,
+                                  &got);
+    if (rr == try_again)
+    {
+        return;
+    }
+    if (rr != ok)
+    {
+        /* end_of_data or error: the peer is gone. Closing bumps the slot
+         * generation, so a completion still in flight on a worker thread
+         * lands as not_found instead of on a recycled connection. */
+        slot_close(slot);
+        return;
+    }
+
+    /* Pipelined bytes belonging to a later request. Keep them buffered;
+     * they are parsed once the deferred response has been sent. */
+    slot->recv_used += got;
+}
+
 static void slot_advance(http_server_connection_slot_t* slot)
 {
     switch (slot->state)
     {
         case http_slot_state_handshaking: slot_drive_handshake(slot); break;
         case http_slot_state_receiving:   slot_drive_receive(slot);   break;
+        case http_slot_state_pending:     slot_probe_pending(slot);   break;
         case http_slot_state_sending:     slot_drive_send(slot);      break;
         default:                          slot_close(slot);           break;
     }
@@ -584,6 +708,183 @@ static void on_connection_io(int fd, uint32_t events, void* user)
         return;
     }
     slot_advance(slot);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Deferred responses.
+ * ------------------------------------------------------------------------- */
+
+/* Serialise responses handed back by worker threads. Runs on the loop
+ * thread after every iteration, which is what keeps the send buffer
+ * single-threaded even though completions arrive from anywhere. */
+static void flush_pending_responses(http_server_t* server)
+{
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+
+        http_response_t response;
+        bool            have = false;
+
+        (void)pthread_mutex_lock(&server->pending_mutex);
+        if (slot->in_use &&
+            slot->state == http_slot_state_pending &&
+            slot->pending_ready)
+        {
+            response            = slot->pending_response;
+            slot->pending_ready = false;
+            /* Claim the slot before dropping the lock so a second
+             * completion cannot race in behind this one. */
+            slot->state         = http_slot_state_sending;
+            have                = true;
+        }
+        (void)pthread_mutex_unlock(&server->pending_mutex);
+
+        if (have)
+        {
+            serialize_and_send(slot, &response);
+        }
+    }
+}
+
+/* Enforce the deferral ceiling. An application that loses track of a
+ * handle must not strand a connection slot for the life of the process. */
+static void sweep_pending_deadlines(http_server_t* server)
+{
+    uint64_t now = now_ms();
+
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+        bool expired = false;
+
+        (void)pthread_mutex_lock(&server->pending_mutex);
+        if (slot->in_use &&
+            slot->state == http_slot_state_pending &&
+            !slot->pending_ready &&
+            now >= slot->pending_deadline_ms)
+        {
+            slot->state = http_slot_state_sending;
+            expired     = true;
+        }
+        (void)pthread_mutex_unlock(&server->pending_mutex);
+
+        if (expired)
+        {
+            slot->client_wants_close = true;
+            respond_with_status(slot, HTTP_CODE_504, HTTP_REASON_PHRASE_504);
+        }
+    }
+}
+
+/* How long the loop may sleep. With nothing parked we block indefinitely
+ * and rely on event_loop_wake() from http_server_respond; with something
+ * parked we must surface in time to enforce its deadline. */
+static int next_tick_ms(http_server_t* server)
+{
+    uint64_t soonest = 0;
+    bool     any     = false;
+
+    (void)pthread_mutex_lock(&server->pending_mutex);
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+        if (slot->in_use && slot->state == http_slot_state_pending)
+        {
+            if (!any || slot->pending_deadline_ms < soonest)
+            {
+                soonest = slot->pending_deadline_ms;
+                any     = true;
+            }
+        }
+    }
+    (void)pthread_mutex_unlock(&server->pending_mutex);
+
+    if (!any)
+    {
+        return -1;
+    }
+
+    uint64_t now = now_ms();
+    if (soonest <= now)
+    {
+        return 0;
+    }
+
+    uint64_t delta = soonest - now;
+    /* Cap the sleep so shutdown latency stays bounded on backends whose
+     * wake is advisory rather than immediate. */
+    if (delta > 1000)
+    {
+        delta = 1000;
+    }
+    return (int)delta;
+}
+
+result_t http_server_respond(http_server_t*         server,
+                             http_response_handle_t handle,
+                             http_response_t*       response)
+{
+    if (server == NULL || response == NULL || handle.slot == NULL ||
+        server->storage == NULL)
+    {
+        return invalid_argument;
+    }
+
+    http_server_connection_slot_t* slot = (http_server_connection_slot_t*)handle.slot;
+
+    /* Validate the handle before dereferencing it, so a corrupted or
+     * fabricated one cannot become a wild write.
+     *
+     * Done in uintptr_t rather than by comparing pointers: relational
+     * comparison of pointers that are not into the same array object is
+     * undefined behaviour in C, so `slot < first || slot >= limit` would
+     * be relying on exactly the thing it is trying to defend against.
+     * The modulo check additionally rejects a pointer that lands inside
+     * the array but not on a slot boundary. */
+    {
+        uintptr_t base  = (uintptr_t)(void*)server->storage->slots;
+        uintptr_t probe = (uintptr_t)handle.slot;
+        size_t    stride = sizeof(http_server_connection_slot_t);
+        uintptr_t extent = (uintptr_t)server->storage->slot_count * (uintptr_t)stride;
+
+        if (probe < base || probe >= base + extent ||
+            ((probe - base) % (uintptr_t)stride) != 0)
+        {
+            return invalid_argument;
+        }
+    }
+
+    result_t result;
+
+    (void)pthread_mutex_lock(&server->pending_mutex);
+    if (!slot->in_use ||
+        slot->state != http_slot_state_pending ||
+        slot->generation != handle.generation)
+    {
+        /* Peer disconnected, deadline fired, or the slot was recycled.
+         * Routine in normal operation -- the caller drops the handle. */
+        result = not_found;
+    }
+    else if (slot->pending_ready)
+    {
+        result = error;   /* already completed once */
+    }
+    else
+    {
+        slot->pending_response = *response;
+        slot->pending_ready    = true;
+        result                 = ok;
+    }
+    (void)pthread_mutex_unlock(&server->pending_mutex);
+
+    if (result == ok)
+    {
+        /* Pull the loop thread out of its wait so the response goes out
+         * now rather than whenever the next socket event happens. */
+        (void)event_loop_wake(&server->loop);
+    }
+    return result;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -609,9 +910,18 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
         (void)pthread_mutex_destroy(&server->state_mutex);
         return error;
     }
+    if (pthread_mutex_init(&server->pending_mutex, NULL) != 0)
+    {
+        (void)pthread_cond_destroy(&server->state_cond);
+        (void)pthread_mutex_destroy(&server->state_mutex);
+        return error;
+    }
 
     server->storage     = storage;
     server->route_count = 0;
+    server->pending_timeout_ms = (config->deferred_timeout_ms != 0)
+                                    ? config->deferred_timeout_ms
+                                    : HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS;
 
     for (uint32_t i = 0; i < storage->slot_count; i++)
     {
@@ -619,6 +929,11 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
         storage->slots[i].server            = NULL;
         storage->slots[i].state             = http_slot_state_idle;
         storage->slots[i].registered_events = 0;
+        /* Caller-supplied storage is not guaranteed to be zeroed, and a
+         * garbage generation would make deferral handles unverifiable. */
+        storage->slots[i].generation          = 0;
+        storage->slots[i].pending_ready       = false;
+        storage->slots[i].pending_deadline_ms = 0;
     }
     for (uint32_t i = 0; i < storage->route_count; i++)
     {
@@ -655,6 +970,7 @@ result_t http_server_deinit(http_server_t* server)
     }
     server->route_count = 0;
 
+    (void)pthread_mutex_destroy(&server->pending_mutex);
     (void)pthread_cond_destroy(&server->state_cond);
     (void)pthread_mutex_destroy(&server->state_mutex);
     return ok;
@@ -830,7 +1146,23 @@ result_t http_server_run(http_server_t* server)
         server_set_state(server, http_server_state_running);
     }
 
-    result_t result = event_loop_run(&server->loop);
+    /* Deliberately not event_loop_run(): deferred responses need a hook
+     * after each iteration, to flush completions posted by worker threads
+     * and to enforce deferral deadlines. event_loop_run offers no such
+     * hook; run_once is exactly that hook. Stop is observed through the
+     * server's own published state, which http_server_stop sets before it
+     * stops the loop, so no event_loop internals are touched here. */
+    result_t result = ok;
+    while (server_get_state(server) == http_server_state_running)
+    {
+        result = event_loop_run_once(&server->loop, next_tick_ms(server));
+        if (is_error(result))
+        {
+            break;
+        }
+        flush_pending_responses(server);
+        sweep_pending_deadlines(server);
+    }
 
     /* Tear down: close any in-flight connections and unregister fds. */
     for (uint32_t i = 0; i < server->storage->slot_count; i++)
@@ -847,7 +1179,11 @@ result_t http_server_run(http_server_t* server)
             }
             (void)socket_deinit(&slot->connection.socket);
             slot->connection.endpoint = NULL;
+            (void)pthread_mutex_lock(&server->pending_mutex);
+            slot->pending_ready = false;
+            slot->generation++;
             slot->in_use = false;
+            (void)pthread_mutex_unlock(&server->pending_mutex);
         }
     }
 

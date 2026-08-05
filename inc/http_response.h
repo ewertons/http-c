@@ -1,6 +1,8 @@
 #ifndef HTTP_RESPONSE_H
 #define HTTP_RESPONSE_H
 
+#include <stdbool.h>
+
 #include "http_headers.h"
 
 #include "span.h" 
@@ -32,6 +34,24 @@ typedef uint32_t (*http_body_provider_t)(void* context, uint8_t* buffer, uint32_
 typedef void     (*http_body_finalizer_t)(void* context);
 
 
+/**
+ * Opaque ticket identifying a request whose response has been deferred.
+ *
+ * Safe to copy and to hold across threads. The generation counter is what
+ * makes that safe: connection slots are a fixed, recycled resource, so a
+ * completion that arrives after its peer disconnected would otherwise be
+ * written into whatever connection inherited the slot. The server bumps
+ * the generation whenever a slot is released, which turns such a late
+ * completion into a clean #not_found instead of a response delivered to
+ * the wrong client.
+ */
+typedef struct http_response_handle
+{
+    void*    slot;        /* opaque: the server's connection slot */
+    uint32_t generation;  /* guards against slot reuse */
+} http_response_handle_t;
+
+
 typedef struct http_response 
 {
     span_t http_version;
@@ -45,7 +65,47 @@ typedef struct http_response
     http_body_provider_t  body_provider;
     http_body_finalizer_t body_finalizer;
     void*                 body_provider_context;
+
+    /* Deferred-response plumbing. `deferral` is populated by the server
+     * before it invokes a handler and is opaque to handlers; `deferred`
+     * is set by #http_response_defer. Both are zeroed along with the rest
+     * of the struct, so a handler that never defers is unaffected. */
+    http_response_handle_t deferral;
+    bool                   deferred;
 } http_response_t;
+
+/**
+ * @brief Defer this response: return from the handler without answering,
+ *        and complete it later via #http_server_respond.
+ *
+ * Call this from inside a request handler. The server will not serialise
+ * anything when the handler returns; the connection is parked until the
+ * handle is completed, the peer disconnects, or the deferral times out
+ * (in which case the server answers 504 on the handler's behalf).
+ *
+ * This is what makes long-poll and other "answer when something happens"
+ * patterns possible: without it a handler must block to wait, and because
+ * the server is a single-threaded event loop, blocking one handler stalls
+ * every other connection.
+ *
+ * @return #not_found if called outside a server request handler (nothing
+ *         populated `deferral`), otherwise #ok.
+ */
+static inline result_t http_response_defer(http_response_t* response,
+                                           http_response_handle_t* out_handle)
+{
+    if (response == NULL || out_handle == NULL)
+    {
+        return invalid_argument;
+    }
+    if (response->deferral.slot == NULL)
+    {
+        return not_found;
+    }
+    response->deferred = true;
+    *out_handle        = response->deferral;
+    return ok;
+}
 
 result_t http_response_initialize(http_response_t* response, span_t http_version, span_t code, span_t reason_phrase, http_headers_t headers);
 

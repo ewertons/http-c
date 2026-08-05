@@ -6,6 +6,11 @@
 #include <string.h>
 
 #include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <cmocka.h>
 
@@ -42,6 +47,12 @@
 #define PORT_PARALLEL        4407
 #define PORT_PLAIN_HTTP      4408
 #define PORT_STREAM_BODY     4409
+#define PORT_DEFERRED_OK      4410
+#define PORT_DEFERRED_TIMEOUT 4411
+#define PORT_DEFERRED_STALE   4412
+#define PORT_DEFERRED_BOGUS   4413
+#define PORT_OVERSIZE         4414
+#define PORT_CHUNKED          4415
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -974,6 +985,611 @@ static void http_server_streams_large_body_succeed(void** state)
     assert_int_equal(ctx.finalize_calls, 1);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Deferred responses (http_response_defer / http_server_respond).
+ *
+ * The server is a single-threaded event loop, so before deferral a handler
+ * that needed to wait had to block -- stalling every other connection.
+ * These cover the mechanism plus the failure modes that would otherwise
+ * surface as rare corruption: completing a handle whose slot has been
+ * recycled, and a deferral nobody ever completes.
+ * ------------------------------------------------------------------------- */
+
+typedef struct deferred_ctx
+{
+    http_server_t*         server;
+    pthread_mutex_t        mutex;
+    bool                   deferred;
+    bool                   release;
+    result_t               defer_result;
+    http_response_handle_t handle;
+    result_t               respond_result;
+    uint8_t                header_storage[256];
+    uint8_t                length_storage[16];
+    http_headers_t         headers;
+} deferred_ctx_t;
+
+static void deferred_ctx_init(deferred_ctx_t* ctx, http_server_t* server)
+{
+    (void)memset(ctx, 0, sizeof(*ctx));
+    ctx->server         = server;
+    ctx->defer_result   = error;
+    ctx->respond_result = error;
+    assert_int_equal(pthread_mutex_init(&ctx->mutex, NULL), 0);
+}
+
+static void deferred_ctx_destroy(deferred_ctx_t* ctx)
+{
+    (void)pthread_mutex_destroy(&ctx->mutex);
+}
+
+/* Runs on the server's loop thread. Deliberately free of cmocka asserts:
+ * a failing assert longjmps, and doing that off the test's own thread
+ * wrecks the run. Results are recorded and asserted by the test body. */
+static void deferring_handler(http_request_t* request, span_t* matches,
+                              uint16_t match_count, http_response_t* out_response,
+                              void* user)
+{
+    (void)request; (void)matches; (void)match_count;
+    deferred_ctx_t* ctx = (deferred_ctx_t*)user;
+
+    http_response_handle_t handle;
+    result_t r = http_response_defer(out_response, &handle);
+
+    (void)pthread_mutex_lock(&ctx->mutex);
+    ctx->defer_result = r;
+    ctx->handle       = handle;
+    ctx->deferred     = true;
+    (void)pthread_mutex_unlock(&ctx->mutex);
+}
+
+static bool wait_for_deferral(deferred_ctx_t* ctx, int max_ms)
+{
+    for (int waited = 0; waited < max_ms; waited += 5)
+    {
+        bool ready;
+        (void)pthread_mutex_lock(&ctx->mutex);
+        ready = ctx->deferred;
+        (void)pthread_mutex_unlock(&ctx->mutex);
+        if (ready)
+        {
+            return true;
+        }
+        task_sleep_ms(5);
+    }
+    return false;
+}
+
+static bool wait_for_release(deferred_ctx_t* ctx, int max_ms)
+{
+    for (int waited = 0; waited < max_ms; waited += 5)
+    {
+        bool go;
+        (void)pthread_mutex_lock(&ctx->mutex);
+        go = ctx->release;
+        (void)pthread_mutex_unlock(&ctx->mutex);
+        if (go)
+        {
+            return true;
+        }
+        task_sleep_ms(5);
+    }
+    return false;
+}
+
+static const span_t DEFERRED_BODY = span_from_str_literal("deferred-hello");
+
+static result_t deferred_responder(void* state, task_t* self)
+{
+    (void)self;
+    deferred_ctx_t* ctx = (deferred_ctx_t*)state;
+
+    if (!wait_for_deferral(ctx, 2000))
+    {
+        return error;
+    }
+
+    /* Hold the answer until the test explicitly releases us. That is what
+     * makes the "loop still serves others" assertion airtight: when the
+     * second client is served, this request is provably still
+     * unanswered. */
+    if (!wait_for_release(ctx, 5000))
+    {
+        return error;
+    }
+
+    http_response_t response;
+    (void)memset(&response, 0, sizeof(response));
+    response.http_version  = HTTP_VERSION_1_1;
+    response.code          = HTTP_CODE_200;
+    response.reason_phrase = HTTP_REASON_PHRASE_200;
+
+    /* Header and body memory lives in `ctx` (owned by the test frame) and
+     * in static storage, so both stay valid until the response is sent --
+     * which is the contract http_server_respond documents. */
+    (void)http_headers_init(&ctx->headers,
+                            span_init(ctx->header_storage, sizeof(ctx->header_storage)));
+    span_t cl = span_copy_int32(span_init(ctx->length_storage, sizeof(ctx->length_storage)),
+                                (int32_t)span_get_size(DEFERRED_BODY), NULL);
+    (void)http_headers_add(&ctx->headers, HTTP_HEADER_CONTENT_LENGTH, cl);
+    response.headers = ctx->headers;
+    response.body    = DEFERRED_BODY;
+
+    result_t r = http_server_respond(ctx->server, ctx->handle, &response);
+
+    (void)pthread_mutex_lock(&ctx->mutex);
+    ctx->respond_result = r;
+    (void)pthread_mutex_unlock(&ctx->mutex);
+    return r;
+}
+
+static void http_response_defer_outside_handler_fails(void** state)
+{
+    (void)state;
+    http_response_t response;
+    (void)memset(&response, 0, sizeof(response));
+    http_response_handle_t handle;
+
+    assert_int_equal(http_response_defer(NULL, &handle), invalid_argument);
+    assert_int_equal(http_response_defer(&response, NULL), invalid_argument);
+    /* Nothing populated `deferral`, so there is no request to defer. */
+    assert_int_equal(http_response_defer(&response, &handle), not_found);
+    assert_false(response.deferred);
+}
+
+static void http_server_respond_rejects_invalid_handles(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_DEFERRED_BOGUS);
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    http_response_t response;
+    (void)memset(&response, 0, sizeof(response));
+    response.http_version  = HTTP_VERSION_1_1;
+    response.code          = HTTP_CODE_200;
+    response.reason_phrase = HTTP_REASON_PHRASE_200;
+
+    http_response_handle_t handle;
+    (void)memset(&handle, 0, sizeof(handle));
+
+    assert_int_equal(http_server_respond(NULL, handle, &response), invalid_argument);
+    assert_int_equal(http_server_respond(&server, handle, NULL), invalid_argument);
+    assert_int_equal(http_server_respond(&server, handle, &response), invalid_argument);
+
+    /* A slot pointer outside this server's storage must be rejected on
+     * bounds rather than dereferenced into a wild write. */
+    uint8_t elsewhere = 0;
+    handle.slot       = &elsewhere;
+    handle.generation = 0;
+    assert_int_equal(http_server_respond(&server, handle, &response), invalid_argument);
+
+    assert_int_equal(http_server_deinit(&server), ok);
+}
+
+static void http_server_deferred_response_from_worker_thread_succeed(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_DEFERRED_OK);
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    deferred_ctx_t ctx;
+    deferred_ctx_init(&ctx, &server);
+
+    handler_capture_t immediate;
+    handler_capture_init(&immediate);
+    immediate.response_body = span_from_str_literal("immediate");
+
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/slow$"),
+                                           deferring_handler, &ctx), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/fast$"),
+                                           capturing_handler, &immediate), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    task_t* responder = task_run(deferred_responder, &ctx);
+    assert_non_null(responder);
+
+    test_client_t slow_client;
+    client_connect_plain(&slow_client, PORT_DEFERRED_OK);
+    send_simple_request(&slow_client, HTTP_METHOD_GET, span_from_str_literal("/slow"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    assert_true(wait_for_deferral(&ctx, 2000));
+
+    /* The entire point of the feature: with one request parked, the loop
+     * still serves everyone else. This request is issued after the
+     * deferral and must complete before it. */
+    test_client_t fast_client;
+    client_connect_plain(&fast_client, PORT_DEFERRED_OK);
+    send_simple_request(&fast_client, HTTP_METHOD_GET, span_from_str_literal("/fast"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    http_response_t fast_response;
+    assert_int_equal(http_connection_receive_response(&fast_client.connection,
+                                                      client_buffer(&fast_client),
+                                                      &fast_response, NULL), ok);
+    assert_int_equal(span_compare(fast_response.code, HTTP_CODE_200), 0);
+    assert_true(immediate.invoked);
+    /* No body assertion here: capturing_handler sets no Content-Length, so
+     * that response is connection-delimited and the client reads no body.
+     * The deferred response below does set one, and is checked. */
+
+    /* Only now let the worker answer the parked request. Everything above
+     * therefore happened while /slow was still outstanding. */
+    (void)pthread_mutex_lock(&ctx.mutex);
+    ctx.release = true;
+    (void)pthread_mutex_unlock(&ctx.mutex);
+
+    /* And now the deferred one lands, from a different thread. */
+    http_response_t slow_response;
+    assert_int_equal(http_connection_receive_response(&slow_client.connection,
+                                                      client_buffer(&slow_client),
+                                                      &slow_response, NULL), ok);
+    assert_int_equal(span_compare(slow_response.code, HTTP_CODE_200), 0);
+    assert_int_equal(span_compare(slow_response.body, DEFERRED_BODY), 0);
+
+    assert_true(task_wait(responder));
+    task_release(responder);
+
+    assert_int_equal(ctx.defer_result, ok);
+    assert_int_equal(ctx.respond_result, ok);
+
+    client_disconnect(&fast_client);
+    client_disconnect(&slow_client);
+
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    handler_capture_destroy(&immediate);
+    deferred_ctx_destroy(&ctx);
+}
+
+static void http_server_deferred_response_times_out_with_504(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_DEFERRED_TIMEOUT);
+    /* Short ceiling so the test does not sit out the 30s default. */
+    cfg.deferred_timeout_ms = 200;
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    deferred_ctx_t ctx;
+    deferred_ctx_init(&ctx, &server);
+
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/never$"),
+                                           deferring_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_DEFERRED_TIMEOUT);
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/never"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    /* Nobody ever calls http_server_respond. Without the deadline sweep
+     * this connection would be stranded for the life of the process. */
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL), ok);
+    assert_int_equal(span_compare(response.code, HTTP_CODE_504), 0);
+    assert_default_response_is_framed(&response);
+
+    assert_true(wait_for_deferral(&ctx, 1000));
+    assert_int_equal(ctx.defer_result, ok);
+
+    /* The handle died with the deferral. A late completion must be
+     * refused, not written into whatever reuses the slot. */
+    http_response_t late;
+    (void)memset(&late, 0, sizeof(late));
+    late.http_version  = HTTP_VERSION_1_1;
+    late.code          = HTTP_CODE_200;
+    late.reason_phrase = HTTP_REASON_PHRASE_200;
+    assert_int_equal(http_server_respond(&server, ctx.handle, &late), not_found);
+
+    client_disconnect(&client);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    deferred_ctx_destroy(&ctx);
+}
+
+static void http_server_deferred_handle_stale_after_disconnect(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_DEFERRED_STALE);
+    /* Long ceiling: the disconnect must be what invalidates the handle,
+     * not the sweep. */
+    cfg.deferred_timeout_ms = 30000;
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    deferred_ctx_t ctx;
+    deferred_ctx_init(&ctx, &server);
+
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/abandon$"),
+                                           deferring_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_DEFERRED_STALE);
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/abandon"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    assert_true(wait_for_deferral(&ctx, 2000));
+
+    /* The closed-tab case: the peer goes away while its request is
+     * parked. The slot must be reclaimed promptly rather than held to
+     * the deadline, and the outstanding handle must go stale with it. */
+    client_disconnect(&client);
+    task_sleep_ms(250);
+
+    http_response_t late;
+    (void)memset(&late, 0, sizeof(late));
+    late.http_version  = HTTP_VERSION_1_1;
+    late.code          = HTTP_CODE_200;
+    late.reason_phrase = HTTP_REASON_PHRASE_200;
+    assert_int_equal(http_server_respond(&server, ctx.handle, &late), not_found);
+
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    deferred_ctx_destroy(&ctx);
+}
+
+#define OVERSIZE_BODY_SIZE 10000u
+static uint8_t s_oversize_body[OVERSIZE_BODY_SIZE];
+
+static void http_server_oversize_request_returns_413(void** state)
+{
+    (void)state;
+
+    /* The server answers then closes while the client may still be
+     * writing, so a plain write() into the dying socket would raise
+     * SIGPIPE and take the whole test binary down. */
+    (void)signal(SIGPIPE, SIG_IGN);
+
+    handler_capture_t handler;
+    handler_capture_init(&handler);
+    handler.response_body = span_from_str_literal("never");
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_OVERSIZE);
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_POST,
+                                           span_from_str_literal("^/big$"),
+                                           capturing_handler, &handler), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    (void)memset(s_oversize_body, 'x', sizeof(s_oversize_body));
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_OVERSIZE);
+
+    /* Bigger than the host storage's 8 KiB receive buffer. This used to
+     * drop the connection with no status line at all, which a browser
+     * reports as an unexplained network error with nothing to diagnose. */
+    send_simple_request(&client, HTTP_METHOD_POST, span_from_str_literal("/big"),
+                        HTTP_VERSION_1_1,
+                        span_init(s_oversize_body, sizeof(s_oversize_body)), true);
+
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL), ok);
+    assert_int_equal(span_compare(response.code, HTTP_CODE_413), 0);
+    assert_false(handler.invoked);
+
+    client_disconnect(&client);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    handler_capture_destroy(&handler);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Chunked response decoding (client side).
+ *
+ * http-c's own server always frames with Content-Length, so nothing in the
+ * suite reached read_chunked_body -- yet GitHub, Docker and most real APIs
+ * reply chunked, so every outbound call depends on it. The decoder also
+ * dechunks in place, sharing a single buffer between the raw stream and
+ * the decoded output, which is only sound because the output trails the
+ * parse cursor. A hand-written server is the only way to pin that down.
+ * ------------------------------------------------------------------------- */
+
+static const char CHUNKED_RESPONSE[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "\r\n"
+    "5\r\nHello\r\n"
+    "1\r\n \r\n"
+    "6\r\nchunky\r\n"
+    "1\r\n \r\n"
+    "5\r\nworld\r\n"
+    "1\r\n!\r\n"
+    "0\r\n\r\n";
+
+#define CHUNKED_EXPECTED "Hello chunky world!"
+
+typedef struct raw_server_ctx
+{
+    int           port;
+    volatile bool listening;
+} raw_server_ctx_t;
+
+static result_t raw_chunked_server(void* state, task_t* self)
+{
+    (void)self;
+    raw_server_ctx_t* ctx = (raw_server_ctx_t*)state;
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0)
+    {
+        return error;
+    }
+
+    int one = 1;
+    (void)setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    (void)memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons((uint16_t)ctx->port);
+
+    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(listen_fd, 1) != 0)
+    {
+        (void)close(listen_fd);
+        return error;
+    }
+
+    ctx->listening = true;
+
+    int fd = accept(listen_fd, NULL, NULL);
+    if (fd < 0)
+    {
+        (void)close(listen_fd);
+        return error;
+    }
+
+    /* Read the whole request head before answering.
+     *
+     * Closing a socket that still has unread bytes buffered makes the
+     * kernel send RST rather than FIN, and an RST discards whatever the
+     * peer has not yet read -- including the response just written. An
+     * earlier version of this test replied after a single recv() and
+     * failed about half the time for exactly that reason. */
+    char     scratch[2048];
+    uint32_t used = 0;
+    while (used + 1 < sizeof(scratch))
+    {
+        ssize_t got = recv(fd, scratch + used, sizeof(scratch) - used - 1, 0);
+        if (got <= 0)
+        {
+            break;
+        }
+        used += (uint32_t)got;
+        scratch[used] = '\0';
+        if (strstr(scratch, "\r\n\r\n") != NULL)
+        {
+            break;
+        }
+    }
+
+    /* Dribble the reply out in small writes so the decoder is forced to
+     * refill mid-chunk instead of seeing the whole body at once. That is
+     * what exercises the buffer-sharing path. */
+    const char* p    = CHUNKED_RESPONSE;
+    size_t      left = sizeof(CHUNKED_RESPONSE) - 1;
+    while (left > 0)
+    {
+        size_t  n = (left < 7) ? left : 7;
+        ssize_t w = send(fd, p, n, 0);
+        if (w <= 0)
+        {
+            break;
+        }
+        p    += w;
+        left -= (size_t)w;
+    }
+
+    /* Orderly close: send FIN, then drain until the peer goes away, so the
+     * response is never torn down by an RST. */
+    (void)shutdown(fd, SHUT_WR);
+    for (;;)
+    {
+        char    drain[256];
+        ssize_t got = recv(fd, drain, sizeof(drain), 0);
+        if (got <= 0)
+        {
+            break;
+        }
+    }
+
+    (void)close(fd);
+    (void)close(listen_fd);
+    return ok;
+}
+
+static void http_client_decodes_chunked_response(void** state)
+{
+    (void)state;
+    (void)signal(SIGPIPE, SIG_IGN);
+
+    raw_server_ctx_t ctx;
+    ctx.port      = PORT_CHUNKED;
+    ctx.listening = false;
+
+    task_t* server_task = task_run(raw_chunked_server, &ctx);
+    assert_non_null(server_task);
+
+    for (int waited = 0; waited < 1000 && !ctx.listening; waited += 5)
+    {
+        task_sleep_ms(5);
+    }
+    assert_true(ctx.listening);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_CHUNKED);
+
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL), ok);
+
+    assert_int_equal(span_compare(response.code, HTTP_CODE_200), 0);
+    /* Six chunks reassembled, chunk framing stripped. */
+    assert_int_equal(span_compare(response.body,
+                                  span_from_str_literal(CHUNKED_EXPECTED)), 0);
+
+    client_disconnect(&client);
+    assert_true(task_wait(server_task));
+    task_release(server_task);
+}
+
 /* ------------------------------------------------------------------------- */
 
 int test_http_server()
@@ -1005,6 +1621,17 @@ int test_http_server()
         cmocka_unit_test(http_server_handles_parallel_clients_succeed),
         cmocka_unit_test(http_server_plain_http_GET_request_succeed),
         cmocka_unit_test(http_server_streams_large_body_succeed),
+
+        /* Deferred responses */
+        cmocka_unit_test(http_response_defer_outside_handler_fails),
+        cmocka_unit_test(http_server_respond_rejects_invalid_handles),
+        cmocka_unit_test(http_server_deferred_response_from_worker_thread_succeed),
+        cmocka_unit_test(http_server_deferred_response_times_out_with_504),
+        cmocka_unit_test(http_server_deferred_handle_stale_after_disconnect),
+        cmocka_unit_test(http_server_oversize_request_returns_413),
+
+        /* Client-side chunked decoding */
+        cmocka_unit_test(http_client_decodes_chunked_response),
     };
 
     return cmocka_run_group_tests_name("http_server", tests, NULL, NULL);

@@ -110,7 +110,13 @@ static result_t read_chunked_body(http_connection_t* connection,
             if (olen + take > out_cap) take = out_cap - olen;
             if (take == 0) return insufficient_size;
 
-            memcpy(out_buf + olen, raw_buf + pos, take);
+            /* memmove, not memcpy: out_buf and raw_buf are allowed to be
+             * the same buffer (that is how the caller avoids a scratch
+             * allocation). olen <= pos always holds -- output trails
+             * input because chunk-size lines are consumed and not
+             * emitted -- so this is a forward copy, but the regions do
+             * overlap and memcpy would be undefined. */
+            memmove(out_buf + olen, raw_buf + pos, take);
             olen  += take;
             pos   += take;
             remaining -= take;
@@ -305,25 +311,25 @@ static result_t maybe_read_body(http_connection_t* connection,
 
         if (is_chunked)
         {
-            /* The dechunked output goes into the start of free_buffer.
-             * We use a separate area for raw chunked I/O — if the
-             * remainder already lives inside free_buffer we reuse the
-             * same allocation, just dechunk in-place forward. */
+            /* Dechunk in place, inside the caller's own buffer.
+             *
+             * The raw chunk stream and the dechunked output share this
+             * one region: the output always trails the parse cursor
+             * (chunk-size lines are consumed but not emitted), so the
+             * forward copy inside read_chunked_body never overwrites
+             * bytes it has yet to read. This used to malloc a second
+             * buffer of the same size for the raw stream, which cost an
+             * allocation on every chunked response received and doubled
+             * the peak memory; the library allocates nowhere else on
+             * this path. */
             uint8_t* out_ptr = span_get_ptr(free_buffer);
             uint32_t out_cap = span_get_size(free_buffer);
-
-            /* Use a heap buffer for raw chunked data so we don't
-             * collide with the output area that may overlap. */
-            uint32_t raw_cap = out_cap;
-            uint8_t* raw_buf = (uint8_t*)malloc(raw_cap);
-            if (raw_buf == NULL) return error;
 
             uint32_t body_len = 0;
             result_t r = read_chunked_body(connection,
                                            out_ptr, out_cap, &body_len,
                                            *body, /* remainder from header read */
-                                           raw_buf, raw_cap);
-            free(raw_buf);
+                                           out_ptr, out_cap);
 
             if (is_error(r)) return r;
 

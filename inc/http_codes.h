@@ -14,9 +14,11 @@ static const span_t HTTP_CODE_405 = span_from_str_literal("405");
 static const span_t HTTP_CODE_406 = span_from_str_literal("406");
 static const span_t HTTP_CODE_408 = span_from_str_literal("408");
 static const span_t HTTP_CODE_409 = span_from_str_literal("409");
+static const span_t HTTP_CODE_413 = span_from_str_literal("413");
 static const span_t HTTP_CODE_500 = span_from_str_literal("500");
 static const span_t HTTP_CODE_501 = span_from_str_literal("501");
 static const span_t HTTP_CODE_503 = span_from_str_literal("503");
+static const span_t HTTP_CODE_504 = span_from_str_literal("504");
 static const span_t HTTP_CODE_505 = span_from_str_literal("505");
 
 static const span_t HTTP_REASON_PHRASE_200 = span_from_str_literal("OK");
@@ -30,9 +32,11 @@ static const span_t HTTP_REASON_PHRASE_405 = span_from_str_literal("Method Not A
 static const span_t HTTP_REASON_PHRASE_406 = span_from_str_literal("Not Acceptable");
 static const span_t HTTP_REASON_PHRASE_408 = span_from_str_literal("Request Timeout");
 static const span_t HTTP_REASON_PHRASE_409 = span_from_str_literal("Conflict");
+static const span_t HTTP_REASON_PHRASE_413 = span_from_str_literal("Payload Too Large");
 static const span_t HTTP_REASON_PHRASE_500 = span_from_str_literal("Internal Server Error");
 static const span_t HTTP_REASON_PHRASE_501 = span_from_str_literal("Not Implemented");
 static const span_t HTTP_REASON_PHRASE_503 = span_from_str_literal("Service Unavailable");
+static const span_t HTTP_REASON_PHRASE_504 = span_from_str_literal("Gateway Timeout");
 static const span_t HTTP_REASON_PHRASE_505 = span_from_str_literal("HTTP Version Not Supported");
 
 #endif // HTTP_CODES_H

@@ -18,6 +18,11 @@
 
 #define HTTP_SERVER_DEFAULT_LISTENING_PORT 443
 
+/* How long a deferred response may stay parked before the server answers
+ * 504 on the handler's behalf. Without a ceiling, an application that
+ * loses track of a handle would strand a connection slot forever. */
+#define HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS 30000
+
 /* Forward declaration so the state-changed callback typedef below can
  * mention http_server_t* before the struct is defined. */
 struct http_server;
@@ -70,6 +75,7 @@ typedef enum http_slot_state
     http_slot_state_idle = 0,
     http_slot_state_handshaking,
     http_slot_state_receiving,
+    http_slot_state_pending,
     http_slot_state_sending,
     http_slot_state_closing,
 } http_slot_state_t;
@@ -121,6 +127,21 @@ typedef struct http_server_connection_slot
     http_body_provider_t  stream_provider;
     http_body_finalizer_t stream_finalizer;
     void*                 stream_ctx;
+
+    /* Deferred responses (http_response_defer / http_server_respond).
+     *
+     * `generation` increments every time the slot is released, so a
+     * handle held by a worker thread can be recognised as stale rather
+     * than delivered to whichever connection reused the slot.
+     *
+     * `pending_response` lives here rather than in a separate queue so
+     * the library keeps its "never allocates" property: a slot can have
+     * at most one response in flight, so one inline slot is exactly
+     * enough. Fields below are guarded by http_server_t::pending_mutex. */
+    uint32_t              generation;
+    uint64_t              pending_deadline_ms;
+    bool                  pending_ready;
+    http_response_t       pending_response;
 } http_server_connection_slot_t;
 
 /* Caller-supplied storage. The library treats `slots` and `routes` as
@@ -150,6 +171,11 @@ typedef struct http_server_config
      * #http_server_on_state_changed_cb for the contract. */
     http_server_on_state_changed_cb on_state_changed;
     void*                           on_state_changed_context;
+
+    /* Optional. Ceiling on how long a deferred response may stay parked
+     * before the server answers 504 itself. 0 selects
+     * #HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS. */
+    uint32_t                        deferred_timeout_ms;
 } http_server_config_t;
 
 struct http_server
@@ -172,6 +198,13 @@ struct http_server
     /* Cached from config at init time. */
     http_server_on_state_changed_cb state_changed_cb;
     void*                           state_changed_ctx;
+
+    /* Deferred responses. `pending_mutex` guards the per-slot pending_*
+     * fields and `generation`, because #http_server_respond may be called
+     * from any thread while the loop thread drives the state machine. It
+     * is a leaf lock: never take `state_mutex` while holding it. */
+    pthread_mutex_t                 pending_mutex;
+    uint32_t                        pending_timeout_ms;
 };
 
 static inline http_server_config_t http_server_get_default_config()
@@ -209,5 +242,30 @@ task_t* http_server_run_async(http_server_t* server);
  *        in-flight ones. Safe to call from any thread.
  */
 result_t http_server_stop(http_server_t* server);
+
+/**
+ * @brief Complete a response previously deferred by #http_response_defer.
+ *
+ * Safe to call from any thread -- this is the point of the whole
+ * mechanism: a worker finishes its slow work and hands the answer back to
+ * the loop thread, which serialises and sends it. The response is copied
+ * into the slot and the loop is woken; serialisation itself always
+ * happens on the loop thread, so the send buffer is never touched
+ * concurrently.
+ *
+ * Body lifetime: `response` itself is copied, but the memory its spans
+ * point at is NOT. It must stay valid until the response has been sent.
+ * The caller owns that memory, consistent with the rest of the library.
+ *
+ * @return #ok on success.
+ *         #not_found if the handle is stale -- the peer disconnected, the
+ *         deferral timed out, or the slot was recycled. This is expected,
+ *         not exceptional: callers should drop the handle and move on.
+ *         #error if this handle was already completed.
+ *         #invalid_argument for a NULL/out-of-range handle.
+ */
+result_t http_server_respond(http_server_t*         server,
+                             http_response_handle_t handle,
+                             http_response_t*       response);
 
 #endif // HTTP_LISTENER

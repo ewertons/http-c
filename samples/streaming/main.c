@@ -76,15 +76,12 @@ static const span_t TEXT_PLAIN        = span_from_str_literal("text/plain");
 
 static uint8_t response_headers_buffer[256];
 
-static void upload_handler(http_request_t*  request,
-                           span_t*          path_matches,
-                           uint16_t         path_match_count,
-                           http_response_t* out_response,
-                           void*            user_context)
+static http_handler_outcome_t upload_handler(http_exchange_t* exchange, void* user_context)
 {
-    (void)path_matches;
-    (void)path_match_count;
     (void)user_context;
+
+    http_request_t*  request      = http_exchange_request(exchange);
+    http_response_t* out_response = http_exchange_response(exchange);
 
     /* Compute a tiny checksum over the body so the test is end-to-end. */
     uint32_t sum = 0;
@@ -104,7 +101,7 @@ static void upload_handler(http_request_t*  request,
                           span_init(response_headers_buffer,
                                     (uint32_t)sizeof(response_headers_buffer))) != HL_RESULT_OK)
     {
-        return;
+        return http_handler_close;
     }
     (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_TYPE,   TEXT_PLAIN);
     (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_LENGTH, OK_BODY_LEN_STR);
@@ -112,6 +109,7 @@ static void upload_handler(http_request_t*  request,
     out_response->code          = HTTP_CODE_200;
     out_response->reason_phrase = HTTP_REASON_PHRASE_200;
     out_response->body          = OK_BODY;
+    return http_handler_respond;
 }
 
 /* ------------------------------------------------------------------------- *

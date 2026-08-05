@@ -224,16 +224,10 @@ static bool parse_range(span_t value, uint32_t total, uint32_t* out_start, uint3
 static uint8_t  s_static_headers_buf[256];
 static char     s_static_clen_buf[16];
 
-static void static_handler(http_request_t*  request,
-                           span_t*          path_matches,
-                           uint16_t         path_match_count,
-                           http_response_t* out_response,
-                           void*            user_context)
+static http_handler_outcome_t static_handler(http_exchange_t* exchange, void* user_context)
 {
-    (void)request;
-    (void)path_matches;
-    (void)path_match_count;
-    served_file_t* f = (served_file_t*)user_context;
+    http_response_t* out_response = http_exchange_response(exchange);
+    served_file_t*   f            = (served_file_t*)user_context;
 
     int clen_n = format_u32(s_static_clen_buf, sizeof(s_static_clen_buf), f->size);
     span_t clen_span = span_init((uint8_t*)s_static_clen_buf, (uint32_t)clen_n);
@@ -242,7 +236,7 @@ static void static_handler(http_request_t*  request,
                           span_init(s_static_headers_buf,
                                     (uint32_t)sizeof(s_static_headers_buf))) != HL_RESULT_OK)
     {
-        return;
+        return http_handler_close;
     }
     (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_TYPE,   f->content_type);
     (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_LENGTH, clen_span);
@@ -252,6 +246,7 @@ static void static_handler(http_request_t*  request,
     out_response->code          = HTTP_CODE_200;
     out_response->reason_phrase = HTTP_REASON_PHRASE_200;
     out_response->body          = span_init(f->data, f->size);
+    return http_handler_respond;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -266,21 +261,20 @@ static uint8_t  s_media_headers_buf[256];
 static char     s_media_clen_buf[16];
 static char     s_media_crange_buf[64];
 
-static void media_handler(http_request_t*  request,
-                          span_t*          path_matches,
-                          uint16_t         path_match_count,
-                          http_response_t* out_response,
-                          void*            user_context)
+static http_handler_outcome_t media_handler(http_exchange_t* exchange, void* user_context)
 {
-    (void)path_matches;
-    (void)path_match_count;
-    served_file_t* f = (served_file_t*)user_context;
+    http_request_t*  request      = http_exchange_request(exchange);
+    http_response_t* out_response = http_exchange_response(exchange);
+    served_file_t*   f            = (served_file_t*)user_context;
 
     if (f->size == 0)
     {
-        /* No bytes to serve; fall through to 404 by leaving the default
-         * response untouched. */
-        return;
+        /* Nothing to serve. The old code returned here and commented that
+         * it was "falling through to 404" -- but the pre-filled response
+         * is 200, so it actually shipped an empty 200. Now it says 404. */
+        out_response->code          = HTTP_CODE_404;
+        out_response->reason_phrase = HTTP_REASON_PHRASE_404;
+        return http_handler_respond;
     }
 
     /* Determine [start, end] from the Range header, defaulting to the
@@ -315,7 +309,9 @@ static void media_handler(http_request_t*  request,
                             (unsigned)start, (unsigned)end, (unsigned)f->size);
     if (crange_n <= 0 || (size_t)crange_n >= sizeof(s_media_crange_buf))
     {
-        return; /* leave 404 */
+        out_response->code          = HTTP_CODE_500;
+        out_response->reason_phrase = HTTP_REASON_PHRASE_500;
+        return http_handler_respond;
     }
     span_t crange_span = span_init((uint8_t*)s_media_crange_buf, (uint32_t)crange_n);
 
@@ -323,7 +319,7 @@ static void media_handler(http_request_t*  request,
                           span_init(s_media_headers_buf,
                                     (uint32_t)sizeof(s_media_headers_buf))) != HL_RESULT_OK)
     {
-        return;
+        return http_handler_close;
     }
     (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_TYPE,   f->content_type);
     (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_LENGTH, clen_span);
@@ -340,6 +336,7 @@ static void media_handler(http_request_t*  request,
            (int)span_get_size(request->path), (const char*)span_get_ptr(request->path),
            (unsigned)start, (unsigned)end, (unsigned)f->size, (unsigned)length);
     fflush(stdout);
+    return http_handler_respond;
 }
 
 /* ------------------------------------------------------------------------- *

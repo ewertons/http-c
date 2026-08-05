@@ -53,6 +53,8 @@
 #define PORT_DEFERRED_BOGUS   4413
 #define PORT_OVERSIZE         4414
 #define PORT_CHUNKED          4415
+#define PORT_HANDLER_CLOSE    4416
+#define PORT_DEFERRAL_CANCEL  4417
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -207,13 +209,11 @@ static void handler_capture_destroy(handler_capture_t* h)
     (void)pthread_mutex_destroy(&h->mutex);
 }
 
-static void capturing_handler(http_request_t* request,
-                              span_t* path_matches,
-                              uint16_t number_of_matches,
-                              http_response_t* out_response,
-                              void* user_context)
+static http_handler_outcome_t capturing_handler(http_exchange_t* exchange, void* user_context)
 {
-    handler_capture_t* h = (handler_capture_t*)user_context;
+    handler_capture_t*    h       = (handler_capture_t*)user_context;
+    http_request_t*       request = http_exchange_request(exchange);
+    http_response_t* out_response = http_exchange_response(exchange);
 
     (void)pthread_mutex_lock(&h->mutex);
 
@@ -221,12 +221,14 @@ static void capturing_handler(http_request_t* request,
     h->method  = request->method;
     h->path    = request->path;
 
+    uint16_t number_of_matches = http_exchange_capture_count(exchange);
     h->match_count = number_of_matches;
     for (uint16_t i = 0; i < number_of_matches && i < 5; i++)
     {
-        uint32_t n = span_get_size(path_matches[i]);
+        span_t   capture = http_exchange_capture(exchange, i);
+        uint32_t n       = span_get_size(capture);
         if (n > sizeof(h->match_storage[i])) n = sizeof(h->match_storage[i]);
-        memcpy(h->match_storage[i], span_get_ptr(path_matches[i]), n);
+        memcpy(h->match_storage[i], span_get_ptr(capture), n);
         h->matches[i] = span_init(h->match_storage[i], n);
     }
 
@@ -246,6 +248,7 @@ static void capturing_handler(http_request_t* request,
 
     (void)pthread_cond_broadcast(&h->cond);
     (void)pthread_mutex_unlock(&h->mutex);
+    return http_handler_respond;
 }
 
 static void wait_for_handler(handler_capture_t* h, int max_ms)
@@ -261,9 +264,10 @@ static void wait_for_handler(handler_capture_t* h, int max_ms)
     (void)pthread_mutex_unlock(&h->mutex);
 }
 
-static void noop_handler(http_request_t* r, span_t* m, uint16_t n, http_response_t* o, void* u)
+static http_handler_outcome_t noop_handler(http_exchange_t* e, void* u)
 {
-    (void)r; (void)m; (void)n; (void)o; (void)u;
+    (void)e; (void)u;
+    return http_handler_respond;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -902,14 +906,10 @@ static void stream_finalizer(void* context)
     c->finalize_calls++;
 }
 
-static void streaming_handler(http_request_t* request,
-                              span_t* path_matches,
-                              uint16_t number_of_matches,
-                              http_response_t* out_response,
-                              void* user_context)
+static http_handler_outcome_t streaming_handler(http_exchange_t* exchange, void* user_context)
 {
-    (void)request; (void)path_matches; (void)number_of_matches;
-    stream_ctx_t* c = (stream_ctx_t*)user_context;
+    stream_ctx_t*    c            = (stream_ctx_t*)user_context;
+    http_response_t* out_response = http_exchange_response(exchange);
 
     /* The streaming contract requires the handler to set Content-Length. */
     (void)http_headers_init(&out_response->headers,
@@ -923,6 +923,7 @@ static void streaming_handler(http_request_t* request,
     out_response->body_provider         = stream_provider;
     out_response->body_finalizer        = stream_finalizer;
     out_response->body_provider_context = c;
+    return http_handler_respond;
 }
 
 static void http_server_streams_large_body_succeed(void** state)
@@ -986,34 +987,33 @@ static void http_server_streams_large_body_succeed(void** state)
 }
 
 /* ------------------------------------------------------------------------- *
- * Deferred responses (http_response_defer / http_server_respond).
+ * Deferred responses (http_exchange_defer / http_deferral_complete).
  *
  * The server is a single-threaded event loop, so before deferral a handler
  * that needed to wait had to block -- stalling every other connection.
  * These cover the mechanism plus the failure modes that would otherwise
- * surface as rare corruption: completing a handle whose slot has been
+ * surface as rare corruption: completing a ticket whose slot has been
  * recycled, and a deferral nobody ever completes.
  * ------------------------------------------------------------------------- */
 
 typedef struct deferred_ctx
 {
-    http_server_t*         server;
-    pthread_mutex_t        mutex;
-    bool                   deferred;
-    bool                   release;
-    result_t               defer_result;
-    http_response_handle_t handle;
-    result_t               respond_result;
-    uint8_t                header_storage[256];
-    uint8_t                length_storage[16];
-    http_headers_t         headers;
+    http_server_t*  server;
+    pthread_mutex_t mutex;
+    bool            deferred;
+    bool            release;
+    bool            cancel_instead;
+    http_deferral_t deferral;
+    result_t        respond_result;
+    uint8_t         header_storage[256];
+    uint8_t         length_storage[16];
+    http_headers_t  headers;
 } deferred_ctx_t;
 
 static void deferred_ctx_init(deferred_ctx_t* ctx, http_server_t* server)
 {
     (void)memset(ctx, 0, sizeof(*ctx));
     ctx->server         = server;
-    ctx->defer_result   = error;
     ctx->respond_result = error;
     assert_int_equal(pthread_mutex_init(&ctx->mutex, NULL), 0);
 }
@@ -1026,21 +1026,18 @@ static void deferred_ctx_destroy(deferred_ctx_t* ctx)
 /* Runs on the server's loop thread. Deliberately free of cmocka asserts:
  * a failing assert longjmps, and doing that off the test's own thread
  * wrecks the run. Results are recorded and asserted by the test body. */
-static void deferring_handler(http_request_t* request, span_t* matches,
-                              uint16_t match_count, http_response_t* out_response,
-                              void* user)
+static http_handler_outcome_t deferring_handler(http_exchange_t* exchange, void* user)
 {
-    (void)request; (void)matches; (void)match_count;
     deferred_ctx_t* ctx = (deferred_ctx_t*)user;
 
-    http_response_handle_t handle;
-    result_t r = http_response_defer(out_response, &handle);
+    http_deferral_t deferral = http_exchange_defer(exchange);
 
     (void)pthread_mutex_lock(&ctx->mutex);
-    ctx->defer_result = r;
-    ctx->handle       = handle;
-    ctx->deferred     = true;
+    ctx->deferral = deferral;
+    ctx->deferred = true;
     (void)pthread_mutex_unlock(&ctx->mutex);
+
+    return http_handler_defer;
 }
 
 static bool wait_for_deferral(deferred_ctx_t* ctx, int max_ms)
@@ -1106,7 +1103,7 @@ static result_t deferred_responder(void* state, task_t* self)
 
     /* Header and body memory lives in `ctx` (owned by the test frame) and
      * in static storage, so both stay valid until the response is sent --
-     * which is the contract http_server_respond documents. */
+     * which is the contract http_deferral_complete documents. */
     (void)http_headers_init(&ctx->headers,
                             span_init(ctx->header_storage, sizeof(ctx->header_storage)));
     span_t cl = span_copy_int32(span_init(ctx->length_storage, sizeof(ctx->length_storage)),
@@ -1115,7 +1112,9 @@ static result_t deferred_responder(void* state, task_t* self)
     response.headers = ctx->headers;
     response.body    = DEFERRED_BODY;
 
-    result_t r = http_server_respond(ctx->server, ctx->handle, &response);
+    result_t r = ctx->cancel_instead
+                     ? http_deferral_cancel(ctx->deferral)
+                     : http_deferral_complete(ctx->deferral, &response);
 
     (void)pthread_mutex_lock(&ctx->mutex);
     ctx->respond_result = r;
@@ -1123,21 +1122,7 @@ static result_t deferred_responder(void* state, task_t* self)
     return r;
 }
 
-static void http_response_defer_outside_handler_fails(void** state)
-{
-    (void)state;
-    http_response_t response;
-    (void)memset(&response, 0, sizeof(response));
-    http_response_handle_t handle;
-
-    assert_int_equal(http_response_defer(NULL, &handle), invalid_argument);
-    assert_int_equal(http_response_defer(&response, NULL), invalid_argument);
-    /* Nothing populated `deferral`, so there is no request to defer. */
-    assert_int_equal(http_response_defer(&response, &handle), not_found);
-    assert_false(response.deferred);
-}
-
-static void http_server_respond_rejects_invalid_handles(void** state)
+static void http_deferral_rejects_invalid_tickets(void** state)
 {
     (void)state;
 
@@ -1153,21 +1138,39 @@ static void http_server_respond_rejects_invalid_handles(void** state)
     response.code          = HTTP_CODE_200;
     response.reason_phrase = HTTP_REASON_PHRASE_200;
 
-    http_response_handle_t handle;
-    (void)memset(&handle, 0, sizeof(handle));
+    /* A zeroed ticket names no server and no slot. */
+    http_deferral_t deferral;
+    (void)memset(&deferral, 0, sizeof(deferral));
 
-    assert_int_equal(http_server_respond(NULL, handle, &response), invalid_argument);
-    assert_int_equal(http_server_respond(&server, handle, NULL), invalid_argument);
-    assert_int_equal(http_server_respond(&server, handle, &response), invalid_argument);
+    assert_int_equal(http_deferral_complete(deferral, &response), invalid_argument);
+    assert_int_equal(http_deferral_complete(deferral, NULL), invalid_argument);
+    assert_int_equal(http_deferral_cancel(deferral), invalid_argument);
 
     /* A slot pointer outside this server's storage must be rejected on
      * bounds rather than dereferenced into a wild write. */
     uint8_t elsewhere = 0;
-    handle.slot       = &elsewhere;
-    handle.generation = 0;
-    assert_int_equal(http_server_respond(&server, handle, &response), invalid_argument);
+    deferral.server     = &server;
+    deferral.slot       = (struct http_server_connection_slot*)&elsewhere;
+    deferral.generation = 0;
+    assert_int_equal(http_deferral_complete(deferral, &response), invalid_argument);
+
+    /* Inside the array but not on a slot boundary: the previous bounds
+     * check accepted this and then dereferenced it. */
+    deferral.slot = (struct http_server_connection_slot*)
+                    ((uint8_t*)server.storage->slots + 1);
+    assert_int_equal(http_deferral_complete(deferral, &response), invalid_argument);
 
     assert_int_equal(http_server_deinit(&server), ok);
+}
+
+/* http_exchange_defer cannot fail inside a handler, but a caller can still
+ * hand it nothing. */
+static void http_exchange_defer_on_null_yields_empty_ticket(void** state)
+{
+    (void)state;
+    http_deferral_t deferral = http_exchange_defer(NULL);
+    assert_null(deferral.server);
+    assert_null(deferral.slot);
 }
 
 static void http_server_deferred_response_from_worker_thread_succeed(void** state)
@@ -1244,7 +1247,6 @@ static void http_server_deferred_response_from_worker_thread_succeed(void** stat
     assert_true(task_wait(responder));
     task_release(responder);
 
-    assert_int_equal(ctx.defer_result, ok);
     assert_int_equal(ctx.respond_result, ok);
 
     client_disconnect(&fast_client);
@@ -1287,7 +1289,7 @@ static void http_server_deferred_response_times_out_with_504(void** state)
     send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/never"),
                         HTTP_VERSION_1_1, SPAN_EMPTY, true);
 
-    /* Nobody ever calls http_server_respond. Without the deadline sweep
+    /* Nobody ever completes the deferral. Without the deadline sweep
      * this connection would be stranded for the life of the process. */
     http_response_t response;
     assert_int_equal(http_connection_receive_response(&client.connection,
@@ -1297,16 +1299,15 @@ static void http_server_deferred_response_times_out_with_504(void** state)
     assert_default_response_is_framed(&response);
 
     assert_true(wait_for_deferral(&ctx, 1000));
-    assert_int_equal(ctx.defer_result, ok);
 
-    /* The handle died with the deferral. A late completion must be
+    /* The ticket died with the deferral. A late completion must be
      * refused, not written into whatever reuses the slot. */
     http_response_t late;
     (void)memset(&late, 0, sizeof(late));
     late.http_version  = HTTP_VERSION_1_1;
     late.code          = HTTP_CODE_200;
     late.reason_phrase = HTTP_REASON_PHRASE_200;
-    assert_int_equal(http_server_respond(&server, ctx.handle, &late), not_found);
+    assert_int_equal(http_deferral_complete(ctx.deferral, &late), not_found);
 
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
@@ -1359,7 +1360,7 @@ static void http_server_deferred_handle_stale_after_disconnect(void** state)
     late.http_version  = HTTP_VERSION_1_1;
     late.code          = HTTP_CODE_200;
     late.reason_phrase = HTTP_REASON_PHRASE_200;
-    assert_int_equal(http_server_respond(&server, ctx.handle, &late), not_found);
+    assert_int_equal(http_deferral_complete(ctx.deferral, &late), not_found);
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
@@ -1621,6 +1622,118 @@ static void http_client_decodes_chunked_response(void** state)
     (void)pthread_mutex_destroy(&ctx.mutex);
 }
 
+/* Both of the behaviours below were inexpressible before the outcome enum:
+ * a handler had to produce some response, and a worker that knew no answer
+ * was coming had no way to say so. */
+
+static http_handler_outcome_t closing_handler(http_exchange_t* exchange, void* user)
+{
+    (void)exchange;
+    bool* invoked = (bool*)user;
+    *invoked = true;
+    return http_handler_close;
+}
+
+static void http_server_handler_close_drops_connection(void** state)
+{
+    (void)state;
+    (void)signal(SIGPIPE, SIG_IGN);
+
+    bool invoked = false;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_HANDLER_CLOSE);
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/drop$"),
+                                           closing_handler, &invoked), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_HANDLER_CLOSE);
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/drop"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    /* No status line at all -- the connection is simply gone. */
+    http_response_t response;
+    assert_int_not_equal(http_connection_receive_response(&client.connection,
+                                                          client_buffer(&client),
+                                                          &response, NULL), ok);
+    assert_true(invoked);
+
+    client_disconnect(&client);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+}
+
+static void http_server_deferral_cancel_yields_503(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_DEFERRAL_CANCEL);
+    /* Long ceiling: the cancel must be what answers, not the sweep. */
+    cfg.deferred_timeout_ms = 30000;
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    deferred_ctx_t ctx;
+    deferred_ctx_init(&ctx, &server);
+    ctx.cancel_instead = true;
+
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/giveup$"),
+                                           deferring_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    task_t* responder = task_run(deferred_responder, &ctx);
+    assert_non_null(responder);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_DEFERRAL_CANCEL);
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/giveup"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    assert_true(wait_for_deferral(&ctx, 2000));
+
+    (void)pthread_mutex_lock(&ctx.mutex);
+    ctx.release = true;
+    (void)pthread_mutex_unlock(&ctx.mutex);
+
+    /* The client learns immediately that no answer is coming, instead of
+     * waiting out the full deferral timeout. */
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL), ok);
+    assert_int_equal(span_compare(response.code, HTTP_CODE_503), 0);
+    assert_default_response_is_framed(&response);
+
+    assert_true(task_wait(responder));
+    task_release(responder);
+    assert_int_equal(ctx.respond_result, ok);
+
+    client_disconnect(&client);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    deferred_ctx_destroy(&ctx);
+}
+
 /* ------------------------------------------------------------------------- */
 
 int test_http_server()
@@ -1654,12 +1767,14 @@ int test_http_server()
         cmocka_unit_test(http_server_streams_large_body_succeed),
 
         /* Deferred responses */
-        cmocka_unit_test(http_response_defer_outside_handler_fails),
-        cmocka_unit_test(http_server_respond_rejects_invalid_handles),
+        cmocka_unit_test(http_exchange_defer_on_null_yields_empty_ticket),
+        cmocka_unit_test(http_deferral_rejects_invalid_tickets),
         cmocka_unit_test(http_server_deferred_response_from_worker_thread_succeed),
         cmocka_unit_test(http_server_deferred_response_times_out_with_504),
         cmocka_unit_test(http_server_deferred_handle_stale_after_disconnect),
         cmocka_unit_test(http_server_oversize_request_returns_413),
+        cmocka_unit_test(http_server_handler_close_drops_connection),
+        cmocka_unit_test(http_server_deferral_cancel_yields_503),
 
         /* Client-side chunked decoding */
         cmocka_unit_test(http_client_decodes_chunked_response),

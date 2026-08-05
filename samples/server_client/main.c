@@ -119,15 +119,12 @@ static void print_http_response(http_response_t* response)
 
 static uint8_t response_headers_buffer[256];
 
-static void hello_handler(http_request_t*  request,
-                          span_t*          path_matches,
-                          uint16_t         path_match_count,
-                          http_response_t* out_response,
-                          void*            user_context)
+static http_handler_outcome_t hello_handler(http_exchange_t* exchange, void* user_context)
 {
-    (void)path_matches;
-    (void)path_match_count;
     (void)user_context;
+
+    http_request_t*  request      = http_exchange_request(exchange);
+    http_response_t* out_response = http_exchange_response(exchange);
 
     print_banner("SERVER", "received request");
     print_http_request(request);
@@ -139,7 +136,10 @@ static void hello_handler(http_request_t*  request,
                           span_init(response_headers_buffer,
                                     (uint32_t)sizeof(response_headers_buffer))) != HL_RESULT_OK)
     {
-        return;
+        /* Without a header buffer the reply cannot be framed, so there is
+         * nothing useful to send. Saying so explicitly beats returning and
+         * shipping an unframed response. */
+        return http_handler_close;
     }
 
     (void)http_headers_add(&out_response->headers,
@@ -150,6 +150,7 @@ static void hello_handler(http_request_t*  request,
     out_response->code          = HTTP_CODE_200;
     out_response->reason_phrase = HTTP_REASON_PHRASE_200;
     out_response->body          = HELLO_BODY;
+    return http_handler_respond;
 }
 
 /* ------------------------------------------------------------------------- *

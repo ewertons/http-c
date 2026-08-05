@@ -45,22 +45,17 @@ static const span_t CONTENT_TYPE_HTML = span_from_str_literal("text/html");
 
 static uint8_t s_response_headers_buffer[128];
 
-static void index_handler(http_request_t*  request,
-                          span_t*          path_matches,
-                          uint16_t         path_match_count,
-                          http_response_t* out_response,
-                          void*            user_context)
+static http_handler_outcome_t index_handler(http_exchange_t* exchange, void* user_context)
 {
-    (void)request;
-    (void)path_matches;
-    (void)path_match_count;
     (void)user_context;
+
+    http_response_t* out_response = http_exchange_response(exchange);
 
     if (http_headers_init(&out_response->headers,
                           span_init(s_response_headers_buffer,
                                     (uint32_t)sizeof(s_response_headers_buffer))) != HL_RESULT_OK)
     {
-        return;
+        return http_handler_close;
     }
 
     static char content_length_buffer[12];
@@ -79,6 +74,7 @@ static void index_handler(http_request_t*  request,
     out_response->code          = HTTP_CODE_200;
     out_response->reason_phrase = HTTP_REASON_PHRASE_200;
     out_response->body          = INDEX_BODY;
+    return http_handler_respond;
 }
 
 void app_main(void)

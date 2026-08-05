@@ -28,7 +28,123 @@
 struct http_server;
 typedef struct http_server http_server_t;
 
-typedef void (*http_request_handler_t)(http_request_t* request, span_t* path_matches, uint16_t number_of_matches, http_response_t* out_response, void* user_context);
+/* Forward declaration only -- the exchange holds a slot pointer, and the
+ * slot is defined further down. Deliberately not a typedef here: pairing a
+ * forward `typedef struct X X;` with a later `typedef struct X {...} X;`
+ * is a typedef redefinition, which C99 rejects under -Wpedantic. */
+struct http_server_connection_slot;
+
+/**
+ * @brief What a handler decided to do with a request.
+ *
+ * Returning an outcome rather than writing a flag means every exit path
+ * has to say what it meant. A handler that hits an error and simply
+ * returns cannot accidentally ship whatever half-filled response happened
+ * to be in the buffer.
+ */
+typedef enum http_handler_outcome
+{
+    /** The response is complete. Send it. */
+    http_handler_respond = 0,
+
+    /** Answer later, through the #http_deferral_t taken from the exchange.
+     *  The connection is parked; nothing is serialised yet. */
+    http_handler_defer,
+
+    /** Drop the connection without answering. */
+    http_handler_close,
+} http_handler_outcome_t;
+
+/**
+ * @brief Ticket for a request whose answer was deferred.
+ *
+ * Safe to copy and to hold across threads, and self-describing -- it
+ * carries the server, so completing one needs nothing else threaded
+ * through the application.
+ *
+ * The generation counter is what makes holding it safe. Connection slots
+ * are a fixed, recycled resource, so a completion arriving after its peer
+ * disconnected would otherwise be written into whatever connection
+ * inherited the slot. Releasing a slot bumps its generation, turning such
+ * a late completion into a clean #not_found rather than a response
+ * delivered to the wrong client.
+ */
+typedef struct http_deferral
+{
+    http_server_t*                      server;
+    struct http_server_connection_slot* slot;
+    uint32_t                            generation;
+} http_deferral_t;
+
+/**
+ * @brief Everything a handler is given for one request.
+ *
+ * Passed instead of loose parameters so the set can grow without breaking
+ * handlers again, and so deferral hangs off the request -- which is what
+ * it is actually about -- rather than off the response, which is a
+ * wire-format type the client half uses too.
+ *
+ * Treat the fields as private; use the accessors.
+ */
+typedef struct http_exchange
+{
+    struct http_server_connection_slot* slot;
+    http_request_t*                     request;
+    span_t*                             captures;
+    uint16_t                            capture_count;
+    http_response_t*                    response;
+    bool                                defer_requested;
+} http_exchange_t;
+
+/**
+ * @brief Handles one request.
+ *
+ * Runs on the server's single event-loop thread and MUST NOT block: while
+ * a handler runs, no other connection is served. Anything slow belongs on
+ * another thread, with the request deferred until that work finishes.
+ */
+typedef http_handler_outcome_t (*http_request_handler_t)(http_exchange_t* exchange,
+                                                         void*            user_context);
+
+/* Deliberately not const: http_headers_find and friends are not
+ * const-correct yet, so returning a const pointer would force a cast at
+ * every call site that inspects a header. Const-correcting the request and
+ * headers API is worth doing, but as its own change. */
+static inline http_request_t* http_exchange_request(http_exchange_t* exchange)
+{
+    return (exchange != NULL) ? exchange->request : NULL;
+}
+
+static inline http_response_t* http_exchange_response(http_exchange_t* exchange)
+{
+    return (exchange != NULL) ? exchange->response : NULL;
+}
+
+static inline uint16_t http_exchange_capture_count(const http_exchange_t* exchange)
+{
+    return (exchange != NULL) ? exchange->capture_count : (uint16_t)0;
+}
+
+/** Bounds-checked; an out-of-range index yields an empty span rather than
+ *  reading past the match array. */
+static inline span_t http_exchange_capture(const http_exchange_t* exchange, uint16_t index)
+{
+    if (exchange == NULL || index >= exchange->capture_count)
+    {
+        return SPAN_EMPTY;
+    }
+    return exchange->captures[index];
+}
+
+/**
+ * @brief Take a deferral ticket for this request.
+ *
+ * Cannot fail: inside a handler there is always a connection to defer.
+ * The handler must then return #http_handler_defer -- taking a ticket and
+ * returning #http_handler_respond leaves the ticket dangling, which the
+ * server logs.
+ */
+http_deferral_t http_exchange_defer(http_exchange_t* exchange);
 
 typedef enum
 {
@@ -141,6 +257,7 @@ typedef struct http_server_connection_slot
     uint32_t              generation;
     uint64_t              pending_deadline_ms;
     bool                  pending_ready;
+    bool                  pending_cancelled;
     http_response_t       pending_response;
 } http_server_connection_slot_t;
 
@@ -244,28 +361,36 @@ task_t* http_server_run_async(http_server_t* server);
 result_t http_server_stop(http_server_t* server);
 
 /**
- * @brief Complete a response previously deferred by #http_response_defer.
+ * @brief Complete a deferred response. Safe to call from any thread.
  *
- * Safe to call from any thread -- this is the point of the whole
- * mechanism: a worker finishes its slow work and hands the answer back to
- * the loop thread, which serialises and sends it. The response is copied
- * into the slot and the loop is woken; serialisation itself always
- * happens on the loop thread, so the send buffer is never touched
- * concurrently.
+ * This is the point of the whole mechanism: a worker finishes its slow
+ * work and hands the answer back to the loop thread, which serialises and
+ * sends it. The response is copied into the slot and the loop is woken;
+ * serialisation itself always happens on the loop thread, so the send
+ * buffer is never touched concurrently.
  *
  * Body lifetime: `response` itself is copied, but the memory its spans
  * point at is NOT. It must stay valid until the response has been sent.
  * The caller owns that memory, consistent with the rest of the library.
  *
  * @return #ok on success.
- *         #not_found if the handle is stale -- the peer disconnected, the
- *         deferral timed out, or the slot was recycled. This is expected,
- *         not exceptional: callers should drop the handle and move on.
- *         #error if this handle was already completed.
- *         #invalid_argument for a NULL/out-of-range handle.
+ *         #not_found if the deferral is stale -- the peer disconnected, it
+ *         timed out, or the slot was recycled. Expected, not exceptional:
+ *         drop the ticket and move on.
+ *         #error if it was already completed.
+ *         #invalid_argument for a malformed ticket.
  */
-result_t http_server_respond(http_server_t*         server,
-                             http_response_handle_t handle,
-                             http_response_t*       response);
+result_t http_deferral_complete(http_deferral_t deferral, http_response_t* response);
+
+/**
+ * @brief Abandon a deferred response: the server answers 503 and closes.
+ *
+ * For when the application knows it will never produce an answer (it is
+ * shutting down, the resource is gone). Without it the client would wait
+ * out the full deferral timeout for a reply that was never coming.
+ *
+ * @return the same codes as #http_deferral_complete.
+ */
+result_t http_deferral_cancel(http_deferral_t deferral);
 
 #endif // HTTP_LISTENER

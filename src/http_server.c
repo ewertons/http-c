@@ -831,15 +831,28 @@ result_t http_server_respond(http_server_t*         server,
         return invalid_argument;
     }
 
-    http_server_connection_slot_t* slot  = (http_server_connection_slot_t*)handle.slot;
-    http_server_connection_slot_t* first = server->storage->slots;
-    http_server_connection_slot_t* limit = first + server->storage->slot_count;
+    http_server_connection_slot_t* slot = (http_server_connection_slot_t*)handle.slot;
 
-    /* Bounds-check before dereferencing: a corrupted or fabricated handle
-     * must not become a wild write. */
-    if (slot < first || slot >= limit)
+    /* Validate the handle before dereferencing it, so a corrupted or
+     * fabricated one cannot become a wild write.
+     *
+     * Done in uintptr_t rather than by comparing pointers: relational
+     * comparison of pointers that are not into the same array object is
+     * undefined behaviour in C, so `slot < first || slot >= limit` would
+     * be relying on exactly the thing it is trying to defend against.
+     * The modulo check additionally rejects a pointer that lands inside
+     * the array but not on a slot boundary. */
     {
-        return invalid_argument;
+        uintptr_t base  = (uintptr_t)(void*)server->storage->slots;
+        uintptr_t probe = (uintptr_t)handle.slot;
+        size_t    stride = sizeof(http_server_connection_slot_t);
+        uintptr_t extent = (uintptr_t)server->storage->slot_count * (uintptr_t)stride;
+
+        if (probe < base || probe >= base + extent ||
+            ((probe - base) % (uintptr_t)stride) != 0)
+        {
+            return invalid_argument;
+        }
     }
 
     result_t result;

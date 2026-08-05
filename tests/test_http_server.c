@@ -1452,9 +1452,39 @@ static const char CHUNKED_RESPONSE[] =
 
 typedef struct raw_server_ctx
 {
-    int           port;
-    volatile bool listening;
+    int             port;
+    bool            listening;
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
 } raw_server_ctx_t;
+
+/* volatile would not be enough: it orders nothing between threads and
+ * carries no memory barrier, so the reader could observe the flag without
+ * the writes that preceded it -- or never observe it at all. */
+static void raw_server_signal_listening(raw_server_ctx_t* ctx)
+{
+    (void)pthread_mutex_lock(&ctx->mutex);
+    ctx->listening = true;
+    (void)pthread_cond_broadcast(&ctx->cond);
+    (void)pthread_mutex_unlock(&ctx->mutex);
+}
+
+static bool raw_server_wait_listening(raw_server_ctx_t* ctx, int max_ms)
+{
+    bool listening = false;
+
+    (void)pthread_mutex_lock(&ctx->mutex);
+    for (int waited = 0; waited < max_ms && !ctx->listening; waited += 5)
+    {
+        (void)pthread_mutex_unlock(&ctx->mutex);
+        task_sleep_ms(5);
+        (void)pthread_mutex_lock(&ctx->mutex);
+    }
+    listening = ctx->listening;
+    (void)pthread_mutex_unlock(&ctx->mutex);
+
+    return listening;
+}
 
 static result_t raw_chunked_server(void* state, task_t* self)
 {
@@ -1483,7 +1513,7 @@ static result_t raw_chunked_server(void* state, task_t* self)
         return error;
     }
 
-    ctx->listening = true;
+    raw_server_signal_listening(ctx);
 
     int fd = accept(listen_fd, NULL, NULL);
     if (fd < 0)
@@ -1559,15 +1589,13 @@ static void http_client_decodes_chunked_response(void** state)
     raw_server_ctx_t ctx;
     ctx.port      = PORT_CHUNKED;
     ctx.listening = false;
+    assert_int_equal(pthread_mutex_init(&ctx.mutex, NULL), 0);
+    assert_int_equal(pthread_cond_init(&ctx.cond, NULL), 0);
 
     task_t* server_task = task_run(raw_chunked_server, &ctx);
     assert_non_null(server_task);
 
-    for (int waited = 0; waited < 1000 && !ctx.listening; waited += 5)
-    {
-        task_sleep_ms(5);
-    }
-    assert_true(ctx.listening);
+    assert_true(raw_server_wait_listening(&ctx, 2000));
 
     test_client_t client;
     client_connect_plain(&client, PORT_CHUNKED);
@@ -1588,6 +1616,9 @@ static void http_client_decodes_chunked_response(void** state)
     client_disconnect(&client);
     assert_true(task_wait(server_task));
     task_release(server_task);
+
+    (void)pthread_cond_destroy(&ctx.cond);
+    (void)pthread_mutex_destroy(&ctx.mutex);
 }
 
 /* ------------------------------------------------------------------------- */

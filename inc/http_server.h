@@ -277,6 +277,15 @@ typedef struct http_server_storage
 typedef struct http_server_config
 {
     int port;
+    /* Optional. Address to listen on. NULL or empty listens on every
+     * interface, which is the default and the historical behaviour.
+     *
+     * A numeric IPv4 literal only, e.g. "127.0.0.1". It is parsed with
+     * inet_pton, so host names ("localhost") and IPv6 literals ("::1") are
+     * NOT accepted and make http_server_run fail rather than fall back to
+     * listening everywhere -- the reason to set this is to not be reachable,
+     * so a silent wildcard would invert the caller's intent. */
+    const char* bind_address;
     struct
     {
         bool        enable;

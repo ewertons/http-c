@@ -1043,6 +1043,7 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
     http_endpoint_config_t* lc = &server->local_endpoint_config;
     lc->role                     = http_endpoint_server;
     lc->local.port               = config->port;
+    lc->local.address            = config->bind_address;
     lc->tls.enable               = config->tls.enable;
     lc->tls.certificate_file     = config->tls.certificate_file;
     lc->tls.private_key_file     = config->tls.private_key_file;

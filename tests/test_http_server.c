@@ -55,6 +55,8 @@
 #define PORT_CHUNKED          4415
 #define PORT_HANDLER_CLOSE    4416
 #define PORT_DEFERRAL_CANCEL  4417
+#define PORT_BIND_LOOPBACK    4418
+#define PORT_BIND_MALFORMED   4419
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -454,11 +456,62 @@ static void http_server_run_lifecycle_succeed(void** state)
     assert_int_equal(http_server_deinit(&server), ok);
 }
 
+/* --- bind_address -------------------------------------------------------- *
+ * Plain HTTP on purpose: these exercise bind(), not TLS, and must not depend
+ * on the certificate fixtures. */
+
+static void http_server_bind_address_loopback_listens(void** state)
+{
+    (void)state;
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_BIND_LOOPBACK);
+    cfg.bind_address = "127.0.0.1";
+
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/$"),
+                                           noop_handler, NULL), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    /* Connecting is the assertion: it proves the listener actually bound,
+     * rather than merely that run() reported no error. */
+    test_client_t client;
+    client_connect_plain(&client, PORT_BIND_LOOPBACK);
+    client_disconnect(&client);
+
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+
+    assert_int_equal(http_server_deinit(&server), ok);
+}
+
+static void http_server_bind_address_malformed_fails_to_run(void** state)
+{
+    (void)state;
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_BIND_MALFORMED);
+    cfg.bind_address = "not-an-address";
+
+    assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
+
+    /* Synchronous deliberately. If a bad address ever fell back to the
+     * wildcard, this would block serving instead of returning -- so the fact
+     * that it returns at all is half the assertion. */
+    assert_int_not_equal(http_server_run(&server), ok);
+
+    assert_int_equal(http_server_deinit(&server), ok);
+}
+
 static void http_server_handles_GET_request_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;
-    handler_capture_init(&handler);
+    handler_capture_t handler;    handler_capture_init(&handler);
     handler.response_body = span_from_str_literal("hello");
 
     http_server_t server;
@@ -1759,6 +1812,8 @@ int test_http_server()
         cmocka_unit_test(http_server_init_and_deinit_succeed),
         cmocka_unit_test(http_server_add_multiple_routes_succeed),
         cmocka_unit_test(http_server_run_lifecycle_succeed),
+        cmocka_unit_test(http_server_bind_address_loopback_listens),
+        cmocka_unit_test(http_server_bind_address_malformed_fails_to_run),
         cmocka_unit_test(http_server_handles_GET_request_succeed),
         cmocka_unit_test(http_server_handles_POST_with_body_succeed),
         cmocka_unit_test(http_server_path_captures_succeed),

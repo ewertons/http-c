@@ -277,6 +277,9 @@ typedef struct http_server_storage
 typedef struct http_server_config
 {
     int port;
+    /* Optional. Address to listen on, e.g. "127.0.0.1". NULL or empty listens
+     * on every interface, which is the default and the historical behaviour. */
+    const char* bind_address;
     struct
     {
         bool        enable;

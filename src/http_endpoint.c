@@ -40,6 +40,24 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
             endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
             endpoint->socket_config.tls.trusted_certificate_file = config->tls.trusted_certificate_file;
 
+            /* A client endpoint owns no descriptor of its own -- the socket
+             * belongs to the http_connection that http_endpoint_connect
+             * initializes. socket_init is therefore not called here, and
+             * without it nothing resets these two fields: the memset above
+             * leaves both at 0, which is not a sentinel but a real
+             * descriptor.
+             *
+             * http_endpoint_deinit passes this socket to socket_deinit,
+             * which closes every descriptor that is not -1. So each client
+             * endpoint teardown closed fd 0 -- first stdin, and after that
+             * whichever socket the kernel had since handed the lowest free
+             * number to. The victim was usually a live connection owned by
+             * another thread, which then hung forever waiting for a reply
+             * that could no longer be written to it.
+             */
+            endpoint->socket.sd        = -1;
+            endpoint->socket.listen_sd = -1;
+
             result = ok;
         }
     }

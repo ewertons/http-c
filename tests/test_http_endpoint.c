@@ -4,6 +4,9 @@
 #include <setjmp.h>
 #include <inttypes.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <cmocka.h>
 
 #include "niceties.h"
@@ -153,11 +156,58 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(http_endpoint_deinit(&server_endpoint), ok);
 }
 
+/* A client endpoint owns no descriptor -- the socket belongs to the
+ * http_connection -- so tearing one down must close nothing at all.
+ *
+ * It used to close descriptor 0: http_endpoint_init skips socket_init for a
+ * client, so both descriptor fields kept the 0 left by its memset, and
+ * socket_deinit closes anything that is not -1. That took out stdin, and
+ * from then on whichever socket the kernel handed the lowest free number --
+ * typically a live connection on another thread, whose peer then waited for
+ * a reply that could never be written.
+ *
+ * The defect is specific to descriptor 0, so the test has to put a
+ * descriptor it can recognise there: close stdin and open /dev/null, which
+ * the kernel must then place at the lowest free number. Plain TCP
+ * throughout, so no TLS fixtures are required. */
+static void http_endpoint_client_deinit_leaves_descriptor_zero_open(void** state)
+{
+    (void)state;
+
+    int saved_stdin = dup(STDIN_FILENO);
+    assert_true(saved_stdin >= 0);
+    assert_int_equal(close(STDIN_FILENO), 0);
+
+    int probe = open("/dev/null", O_RDONLY);
+    assert_int_equal(probe, STDIN_FILENO);
+
+    http_endpoint_t client_endpoint;
+    http_endpoint_config_t client_endpoint_config = http_endpoint_get_default_secure_client_config();
+    client_endpoint_config.remote.hostname = span_from_str_literal("localhost");
+    client_endpoint_config.remote.port = 4345;
+    client_endpoint_config.tls.enable = false;
+
+    assert_int_equal(http_endpoint_init(&client_endpoint, &client_endpoint_config), ok);
+    assert_int_equal(http_endpoint_deinit(&client_endpoint), ok);
+
+    /* Read the verdict before restoring: a cmocka assertion failure leaves
+     * this function by longjmp, which would strand the process without a
+     * stdin and take every later test with it. */
+    int descriptor_zero = fcntl(STDIN_FILENO, F_GETFD);
+
+    (void)close(STDIN_FILENO);
+    (void)dup2(saved_stdin, STDIN_FILENO);
+    (void)close(saved_stdin);
+
+    assert_int_not_equal(descriptor_zero, -1);
+}
+
 int test_http_endpoint()
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(http_endpoint_init_listener_succeed),
-    cmocka_unit_test(http_endpoint_client_and_server_succeed)
+    cmocka_unit_test(http_endpoint_client_and_server_succeed),
+    cmocka_unit_test(http_endpoint_client_deinit_leaves_descriptor_zero_open)
   };
 
   return cmocka_run_group_tests_name("http_endpoint", tests, NULL, NULL);

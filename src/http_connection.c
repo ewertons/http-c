@@ -35,10 +35,9 @@ static uint64_t io_deadline(const http_connection_t* connection)
 
 /* try_again means the stream produced nothing this time round.
  *
- * There is no sleep here: on the blocking path the socket's own receive slice
- * (see apply_io_slice) has already spent that time, and on the non-blocking
- * path the caller owns the waiting. Yielding covers the wait-forever case so
- * a non-blocking socket cannot become a hot spin. */
+ * No sleep: the blocking path already spent the time in the socket's receive
+ * slice (see apply_io_slice), and the non-blocking path's caller owns the
+ * waiting. The yield only stops a wait-forever non-blocking socket spinning. */
 static result_t await_progress(http_connection_t* connection, uint64_t deadline)
 {
     if (deadline == 0)

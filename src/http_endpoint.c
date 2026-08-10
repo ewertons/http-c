@@ -11,12 +11,11 @@
 #include "http_endpoint.h"
 
 /* Give the descriptor a short receive timeout so a stalled read surfaces as
- * try_again instead of parking in recv forever. The deadline itself lives in
- * the read loops; this only guarantees they get to run.
+ * try_again instead of parking in recv forever; the deadline itself lives in
+ * the read loops and this only guarantees they get to run.
  *
- * Receive only. A send timeout would turn a merely slow peer into a failed
- * write halfway through a request, and a half-sent request is worse than a
- * slow one. */
+ * Receive only: a send timeout would abandon a request half-sent, which is
+ * worse than a slow one. */
 static void apply_io_slice(socket_t* socket, uint32_t io_timeout_ms)
 {
     if (io_timeout_ms == 0 || socket->sd < 0)
@@ -66,21 +65,12 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
             endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
             endpoint->socket_config.tls.trusted_certificate_file = config->tls.trusted_certificate_file;
 
-            /* A client endpoint owns no descriptor of its own -- the socket
-             * belongs to the http_connection that http_endpoint_connect
-             * initializes. socket_init is therefore not called here, and
-             * without it nothing resets these two fields: the memset above
-             * leaves both at 0, which is not a sentinel but a real
-             * descriptor.
-             *
-             * http_endpoint_deinit passes this socket to socket_deinit,
-             * which closes every descriptor that is not -1. So each client
-             * endpoint teardown closed fd 0 -- first stdin, and after that
-             * whichever socket the kernel had since handed the lowest free
-             * number to. The victim was usually a live connection owned by
-             * another thread, which then hung forever waiting for a reply
-             * that could no longer be written to it.
-             */
+            /* No socket_init on this path -- the socket that gets used
+             * belongs to the http_connection -- so the memset leaves both
+             * descriptors at 0, a real one rather than a sentinel.
+             * socket_deinit closes anything but -1, so teardown used to close
+             * fd 0: stdin first, then whichever socket inherited the number,
+             * hanging whoever owned it. */
             endpoint->socket.sd        = -1;
             endpoint->socket.listen_sd = -1;
 

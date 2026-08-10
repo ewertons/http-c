@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <sys/socket.h>
 
 #include "span.h"
 #include "niceties.h"
@@ -7,6 +9,29 @@
 #include "socket_stream.h"
 
 #include "http_endpoint.h"
+
+/* Give the descriptor a short receive timeout so a stalled read surfaces as
+ * try_again instead of parking in recv forever. The deadline itself lives in
+ * the read loops; this only guarantees they get to run.
+ *
+ * Receive only. A send timeout would turn a merely slow peer into a failed
+ * write halfway through a request, and a half-sent request is worse than a
+ * slow one. */
+static void apply_io_slice(socket_t* socket, uint32_t io_timeout_ms)
+{
+    if (io_timeout_ms == 0 || socket->sd < 0)
+    {
+        return;
+    }
+
+    uint32_t slice = io_timeout_ms < HTTP_IO_POLL_SLICE_MS ? io_timeout_ms
+                                                           : HTTP_IO_POLL_SLICE_MS;
+    struct timeval tv;
+    tv.tv_sec  = (time_t)(slice / 1000u);
+    tv.tv_usec = (suseconds_t)((slice % 1000u) * 1000u);
+
+    (void)setsockopt(socket->sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
 
 result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* config)
 {
@@ -20,6 +45,7 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
     {
         (void)memset(endpoint, 0, sizeof(http_endpoint_t));
         endpoint->role = config->role;
+        endpoint->io_timeout_ms = config->io_timeout_ms;
 
         if (endpoint->role == http_endpoint_server)
         {
@@ -80,6 +106,8 @@ result_t http_endpoint_wait_for_connection(http_endpoint_t* endpoint, http_conne
         result = socket_accept(&endpoint->socket, &connection->socket);
         if (is_success(result))
         {
+             connection->io_timeout_ms = endpoint->io_timeout_ms;
+             apply_io_slice(&connection->socket, endpoint->io_timeout_ms);
              result = socket_stream_initialize(&connection->stream, &connection->socket);
         }
     }
@@ -139,6 +167,8 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
             result = socket_connect(&connection->socket);
             if (is_success(result))
             {
+                connection->io_timeout_ms = endpoint->io_timeout_ms;
+                apply_io_slice(&connection->socket, endpoint->io_timeout_ms);
                 result = socket_stream_initialize(&connection->stream, &connection->socket);
             }
         }

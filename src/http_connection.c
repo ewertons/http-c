@@ -1,15 +1,61 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <time.h>
 
 #include "span.h"
 #include "niceties.h"
+#include "logging.h"
 #include "socket_stream.h"
 #include "task.h"
 
 #include "http_endpoint.h"
 #include "http_connection.h"
 #include "http_headers.h"
+
+/* CLOCK_MONOTONIC so a wall-clock adjustment cannot make a deadline fire
+ * early or never. */
+static uint64_t io_now_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* 0 means the caller asked to wait forever. */
+static uint64_t io_deadline(const http_connection_t* connection)
+{
+    return connection->io_timeout_ms == 0
+               ? 0
+               : io_now_ms() + (uint64_t)connection->io_timeout_ms;
+}
+
+/* try_again means the stream produced nothing this time round.
+ *
+ * There is no sleep here: on the blocking path the socket's own receive slice
+ * (see apply_io_slice) has already spent that time, and on the non-blocking
+ * path the caller owns the waiting. Yielding covers the wait-forever case so
+ * a non-blocking socket cannot become a hot spin. */
+static result_t await_progress(http_connection_t* connection, uint64_t deadline)
+{
+    if (deadline == 0)
+    {
+        (void)sched_yield();
+        return ok;
+    }
+
+    if (io_now_ms() >= deadline)
+    {
+        log_error("http_connection: no progress for %u ms; abandoning the exchange",
+                  connection->io_timeout_ms);
+        return error;
+    }
+
+    return ok;
+}
 
 /* ------------------------------------------------------------------ */
 /* Internal: ensure at least `need` bytes are available in the read    */
@@ -21,18 +67,26 @@ static result_t ensure_buffered(http_connection_t* connection,
                                 uint32_t* len, uint32_t pos,
                                 uint32_t need)
 {
+    uint64_t deadline = io_deadline(connection);
+
     while (*len - pos < need)
     {
         if (*len >= buf_cap) return insufficient_size;
         span_t dst  = span_init(buf + *len, buf_cap - *len);
         span_t got, after;
         result_t r = stream_read(&connection->stream, dst, &got, &after);
-        if (r == try_again) { (void)sched_yield(); continue; }
+        if (r == try_again)
+        {
+            result_t w = await_progress(connection, deadline);
+            if (is_error(w)) return w;
+            continue;
+        }
         if (is_error(r) || r == end_of_data || r == end_of_file)
         {
             return (r == end_of_file || r == end_of_data) ? error : r;
         }
         *len += span_get_size(got);
+        deadline = io_deadline(connection); /* bytes arrived: refresh the budget */
     }
     return ok;
 }
@@ -183,6 +237,7 @@ static result_t read_until_headers_complete(http_connection_t* connection,
     span_t original_buffer = buffer;
     span_t bytes_read;
     result_t result;
+    uint64_t deadline = io_deadline(connection);
 
     for (;;)
     {
@@ -195,9 +250,8 @@ static result_t read_until_headers_complete(http_connection_t* connection,
 
         if (result == try_again)
         {
-            /* Yield the rest of our timeslice; cheaper than a 1ms sleep
-             * and resumes as soon as the scheduler picks us again. */
-            (void)sched_yield();
+            result_t w = await_progress(connection, deadline);
+            if (is_error(w)) return w;
             continue;
         }
 
@@ -205,6 +259,8 @@ static result_t read_until_headers_complete(http_connection_t* connection,
         {
             return result;
         }
+
+        deadline = io_deadline(connection);
 
         span_t received = span_slice_out(original_buffer, buffer);
 
@@ -224,6 +280,8 @@ static result_t read_remaining_body(http_connection_t* connection,
                                     span_t free_buffer,
                                     uint32_t needed)
 {
+    uint64_t deadline = io_deadline(connection);
+
     while (span_get_size(*body_so_far) < needed)
     {
         if (span_is_empty(free_buffer))
@@ -236,7 +294,8 @@ static result_t read_remaining_body(http_connection_t* connection,
 
         if (r == try_again)
         {
-            (void)sched_yield();
+            result_t w = await_progress(connection, deadline);
+            if (is_error(w)) return w;
             continue;
         }
 
@@ -244,6 +303,8 @@ static result_t read_remaining_body(http_connection_t* connection,
         {
             return r;
         }
+
+        deadline = io_deadline(connection);
 
         /* If the body was empty so far, anchor it at the start of the bytes
          * just read; otherwise it's already pointing into the buffer and the

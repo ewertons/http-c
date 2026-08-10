@@ -22,6 +22,9 @@ typedef struct http_connection
     http_endpoint_t* endpoint;
     socket_t socket;
     stream_t stream;
+
+    /* Copied from the endpoint at connect/accept. See io_timeout_ms there. */
+    uint32_t io_timeout_ms;
 } http_connection_t;
 
 result_t http_connection_set_endpoint(http_connection_t* connection, http_endpoint_t* endpoint);

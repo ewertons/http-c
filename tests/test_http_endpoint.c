@@ -4,6 +4,13 @@
 #include <setjmp.h>
 #include <inttypes.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
 #include <cmocka.h>
 
 #include "niceties.h"
@@ -153,11 +160,134 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(http_endpoint_deinit(&server_endpoint), ok);
 }
 
+/* Restoring stdin has to be a fixture, not tail code: cmocka leaves a failed
+ * test by longjmp, so any assertion below would skip it and strand every
+ * later test without a descriptor 0. */
+static int save_stdin(void** state)
+{
+    int saved = dup(STDIN_FILENO);
+    if (saved < 0)
+    {
+        return -1;
+    }
+    *state = (void*)(intptr_t)saved;
+    return 0;
+}
+
+static int restore_stdin(void** state)
+{
+    int saved = (int)(intptr_t)*state;
+    (void)close(STDIN_FILENO);
+    (void)dup2(saved, STDIN_FILENO);
+    (void)close(saved);
+    return 0;
+}
+
+/* A client endpoint owns no descriptor, so its teardown must close nothing.
+ * It used to close fd 0 -- see http_endpoint_init. The defect is specific to
+ * descriptor 0, so put a recognizable one there: open() takes the lowest free
+ * number once stdin is closed. Plain TCP, so no TLS fixtures. */
+static void http_endpoint_client_deinit_leaves_descriptor_zero_open(void** state)
+{
+    (void)state;
+
+    assert_int_equal(close(STDIN_FILENO), 0);
+    assert_int_equal(open("/dev/null", O_RDONLY), STDIN_FILENO);
+
+    http_endpoint_t client_endpoint;
+    http_endpoint_config_t client_endpoint_config = http_endpoint_get_default_secure_client_config();
+    client_endpoint_config.remote.hostname = span_from_str_literal("localhost");
+    client_endpoint_config.remote.port = 4345;
+    client_endpoint_config.tls.enable = false;
+
+    assert_int_equal(http_endpoint_init(&client_endpoint, &client_endpoint_config), ok);
+    assert_int_equal(http_endpoint_deinit(&client_endpoint), ok);
+    assert_int_not_equal(fcntl(STDIN_FILENO, F_GETFD), -1);
+}
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* A peer that completes the handshake and then says nothing used to retry
+ * try_again forever, spinning on sched_yield. A backlogged listener that is
+ * never accepted reproduces it: the kernel finishes the client's connect, so
+ * the request goes out and no reply ever comes. */
+static void http_connection_read_gives_up_on_a_silent_peer(void** state)
+{
+    (void)state;
+
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(listener >= 0);
+
+    struct sockaddr_in addr;
+    (void)memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0; /* any free port */
+    assert_int_equal(bind(listener, (struct sockaddr*)&addr, sizeof(addr)), 0);
+    assert_int_equal(listen(listener, 1), 0);
+
+    socklen_t addr_len = sizeof(addr);
+    assert_int_equal(getsockname(listener, (struct sockaddr*)&addr, &addr_len), 0);
+
+    http_endpoint_t endpoint;
+    http_endpoint_config_t config = http_endpoint_get_default_secure_client_config();
+    config.tls.enable      = false;
+    config.remote.hostname = span_from_str_literal("127.0.0.1");
+    config.remote.port     = ntohs(addr.sin_port);
+    config.io_timeout_ms   = 300;
+
+    assert_int_equal(http_endpoint_init(&endpoint, &config), ok);
+
+    http_connection_t connection;
+    assert_int_equal(http_endpoint_connect(&endpoint, &connection), ok);
+
+    uint8_t        header_storage[256];
+    http_headers_t headers;
+    (void)http_headers_init(&headers, span_init(header_storage, (uint32_t)sizeof(header_storage)));
+    (void)http_headers_add(&headers, HTTP_HEADER_HOST, span_from_str_literal("127.0.0.1"));
+
+    http_request_t request;
+    assert_int_equal(http_request_initialize(&request, HTTP_METHOD_GET,
+                                             span_from_str_literal("/"),
+                                             HTTP_VERSION_1_1, headers), ok);
+    assert_int_equal(http_connection_send_request(&connection, &request), ok);
+
+    uint8_t         response_buffer[512];
+    http_response_t response;
+
+    uint64_t started  = monotonic_ms();
+    result_t received = http_connection_receive_response(
+        &connection,
+        span_init(response_buffer, (uint32_t)sizeof(response_buffer)),
+        &response, NULL);
+    uint64_t elapsed = monotonic_ms() - started;
+
+    (void)http_connection_close(&connection);
+    (void)http_endpoint_deinit(&endpoint);
+    (void)close(listener);
+
+    assert_true(is_error(received));
+    /* Generous upper bound -- the point is that it returns at all, and the
+     * old code never would. The lower bound matters just as much: returning
+     * instantly would mean the read failed for some unrelated reason rather
+     * than by running out its budget. */
+    assert_true(elapsed >= 300);
+    assert_true(elapsed < 5000);
+}
+
 int test_http_endpoint()
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(http_endpoint_init_listener_succeed),
-    cmocka_unit_test(http_endpoint_client_and_server_succeed)
+    cmocka_unit_test(http_endpoint_client_and_server_succeed),
+    cmocka_unit_test_setup_teardown(http_endpoint_client_deinit_leaves_descriptor_zero_open,
+                                    save_stdin, restore_stdin),
+    cmocka_unit_test(http_connection_read_gives_up_on_a_silent_peer)
   };
 
   return cmocka_run_group_tests_name("http_endpoint", tests, NULL, NULL);

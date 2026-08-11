@@ -37,10 +37,13 @@ typedef struct http_endpoint_config
     /* Milliseconds a read may make no progress before the exchange fails.
      * 0 waits forever, which is the behaviour this replaced.
      *
-     * On a client this also bounds the TLS handshake, which the socket
-     * layer applies it to before connecting. That is the part worth having:
+     * On a client it is also handed to the socket layer, which spends it on
+     * every step of reaching a peer: the TCP connect, the TLS handshake,
+     * and each blocking receive. None of those had a bound of their own --
      * an address can complete the TCP handshake and then never speak, and
-     * the handshake has no bound of its own.
+     * one that swallows SYNs is otherwise left to tcp_syn_retries.
+     *
+     * It is a budget per step, not for the exchange as a whole.
      *
      * Only affects the blocking API. The non-blocking path reports try_again
      * to its caller, whose event loop already owns the timing. */

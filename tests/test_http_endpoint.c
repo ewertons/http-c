@@ -303,16 +303,19 @@ static void http_endpoint_client_handshake_gives_up_on_a_silent_peer(void** stat
     struct sockaddr_in addr;
     (void)memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(4347);
+    addr.sin_port        = 0; /* any free port, so a busy machine cannot fail this */
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     assert_int_equal(bind(listener, (struct sockaddr*)&addr, sizeof(addr)), 0);
     assert_int_equal(listen(listener, 4), 0);
 
+    socklen_t addr_length = sizeof(addr);
+    assert_int_equal(getsockname(listener, (struct sockaddr*)&addr, &addr_length), 0);
+
     http_endpoint_t endpoint;
     http_endpoint_config_t config = http_endpoint_get_default_secure_client_config();
     config.remote.hostname = span_from_str_literal("127.0.0.1");
-    config.remote.port     = 4347;
+    config.remote.port     = ntohs(addr.sin_port);
     config.io_timeout_ms   = 500;
 
     assert_int_equal(http_endpoint_init(&endpoint, &config), ok);
@@ -326,6 +329,14 @@ static void http_endpoint_client_handshake_gives_up_on_a_silent_peer(void** stat
     assert_true(elapsed >= 400);
     /* Generous, because the point is that it returns at all. */
     assert_true(elapsed < 15000);
+
+    /* The failure path must not leave the connection's TLS context behind.
+     * socket_deinit is what releases it, and it nulls the backend pointer
+     * as it goes -- so this is the observable proof that it ran. The
+     * descriptor alone would prove nothing: the socket layer's own failure
+     * path closes that regardless. */
+    assert_null(connection.socket.tls.backend);
+    assert_int_equal(connection.socket.sd, -1);
 
     (void)http_endpoint_deinit(&endpoint);
     close(listener);

@@ -165,6 +165,16 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
                 apply_io_slice(&connection->socket, endpoint->io_timeout_ms);
                 result = socket_stream_initialize(&connection->stream, &connection->socket);
             }
+            else
+            {
+                /* socket_init allocated a TLS context, and the socket
+                 * layer's connect failure path frees only the per-attempt
+                 * session and descriptor. Callers do not deinitialize an
+                 * object whose creation failed -- and now that a timeout
+                 * makes failure an ordinary outcome rather than a rarity,
+                 * leaving it would leak a context per stalled address. */
+                (void)socket_deinit(&connection->socket);
+            }
         }
     }
 

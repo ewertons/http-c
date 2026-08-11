@@ -280,6 +280,68 @@ static void http_connection_read_gives_up_on_a_silent_peer(void** state)
     assert_true(elapsed < 5000);
 }
 
+/* A peer that completes the TCP handshake and then says nothing is not a
+ * hypothetical: an address whose route is black-holed behaves exactly like
+ * this, and DNS hands those out alongside working ones. The TLS handshake
+ * has no bound of its own, so before io_timeout_ms reached the socket layer
+ * this call never returned -- and with one worker thread behind it, that is
+ * a service that stops answering rather than a slow request.
+ *
+ * The listener here accepts and never writes, so the client's ClientHello
+ * goes unanswered. No fixtures: the client's TLS never gets far enough to
+ * need a certificate from anyone. */
+static void http_endpoint_client_handshake_gives_up_on_a_silent_peer(void** state)
+{
+    (void)state;
+
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(listener >= 0);
+
+    int reuse = 1;
+    (void)setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in addr;
+    (void)memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = 0; /* any free port, so a busy machine cannot fail this */
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    assert_int_equal(bind(listener, (struct sockaddr*)&addr, sizeof(addr)), 0);
+    assert_int_equal(listen(listener, 4), 0);
+
+    socklen_t addr_length = sizeof(addr);
+    assert_int_equal(getsockname(listener, (struct sockaddr*)&addr, &addr_length), 0);
+
+    http_endpoint_t endpoint;
+    http_endpoint_config_t config = http_endpoint_get_default_secure_client_config();
+    config.remote.hostname = span_from_str_literal("127.0.0.1");
+    config.remote.port     = ntohs(addr.sin_port);
+    config.io_timeout_ms   = 500;
+
+    assert_int_equal(http_endpoint_init(&endpoint, &config), ok);
+
+    http_connection_t connection;
+    uint64_t started = monotonic_ms();
+    result_t result  = http_endpoint_connect(&endpoint, &connection);
+    uint64_t elapsed = monotonic_ms() - started;
+
+    assert_int_not_equal(result, ok);
+    assert_true(elapsed >= 400);
+    /* Generous, because the point is that it returns at all. */
+    assert_true(elapsed < 15000);
+
+    /* The failure path must not leave the connection's TLS context behind.
+     * socket_deinit is what releases it, and it nulls the backend pointer
+     * as it goes -- so this is the observable proof that it ran. The
+     * descriptor alone would prove nothing: the socket layer's own failure
+     * path closes that regardless. */
+    assert_null(connection.socket.tls.backend);
+    assert_int_equal(connection.socket.sd, -1);
+
+    (void)http_endpoint_deinit(&endpoint);
+    close(listener);
+}
+
 int test_http_endpoint()
 {
   const struct CMUnitTest tests[] = {
@@ -287,7 +349,8 @@ int test_http_endpoint()
     cmocka_unit_test(http_endpoint_client_and_server_succeed),
     cmocka_unit_test_setup_teardown(http_endpoint_client_deinit_leaves_descriptor_zero_open,
                                     save_stdin, restore_stdin),
-    cmocka_unit_test(http_connection_read_gives_up_on_a_silent_peer)
+    cmocka_unit_test(http_connection_read_gives_up_on_a_silent_peer),
+    cmocka_unit_test(http_endpoint_client_handshake_gives_up_on_a_silent_peer)
   };
 
   return cmocka_run_group_tests_name("http_endpoint", tests, NULL, NULL);

@@ -64,6 +64,10 @@ result_t http_endpoint_init(http_endpoint_t* endpoint, http_endpoint_config_t* c
             endpoint->socket_config.tls.certificate_file = config->tls.certificate_file;
             endpoint->socket_config.tls.private_key_file = config->tls.private_key_file;
             endpoint->socket_config.tls.trusted_certificate_file = config->tls.trusted_certificate_file;
+            /* The socket layer applies this before the TLS handshake, which
+             * apply_io_slice below cannot reach: by the time a connection
+             * exists the handshake has already happened, or hung. */
+            endpoint->socket_config.io_timeout_ms = config->io_timeout_ms;
 
             /* No socket_init on this path -- the socket that gets used
              * belongs to the http_connection -- so the memset leaves both
@@ -160,6 +164,16 @@ result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* con
                 connection->io_timeout_ms = endpoint->io_timeout_ms;
                 apply_io_slice(&connection->socket, endpoint->io_timeout_ms);
                 result = socket_stream_initialize(&connection->stream, &connection->socket);
+            }
+            else
+            {
+                /* socket_init allocated a TLS context, and the socket
+                 * layer's connect failure path frees only the per-attempt
+                 * session and descriptor. Callers do not deinitialize an
+                 * object whose creation failed -- and now that a timeout
+                 * makes failure an ordinary outcome rather than a rarity,
+                 * leaving it would leak a context per stalled address. */
+                (void)socket_deinit(&connection->socket);
             }
         }
     }

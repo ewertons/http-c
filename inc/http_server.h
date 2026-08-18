@@ -240,6 +240,11 @@ typedef struct http_server_connection_slot
      * (body_provider / body_finalizer). */
     bool                  stream_active;
     bool                  stream_eof;
+    /* Set when the handler gave a provider but no Content-Length, and the
+     * connection is one that will be reused -- so the body needs framing
+     * of its own to say where it ends. */
+    bool                  stream_chunked;
+    bool                  stream_terminated;
     http_body_provider_t  stream_provider;
     http_body_finalizer_t stream_finalizer;
     void*                 stream_ctx;

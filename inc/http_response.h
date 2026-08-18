@@ -19,8 +19,14 @@
  * buffer (e.g. a multi-MB file) without buffering it in RAM.
  *
  * Contract:
- *   - The handler MUST set a correct Content-Length header itself; the
- *     server does not derive it from the (streamed) body.
+ *   - Set a correct Content-Length header if the length is known. If none
+ *     is set the server frames the body itself: `Transfer-Encoding:
+ *     chunked` on a keep-alive HTTP/1.1 connection, and body-ends-at-close
+ *     otherwise (which is what HTTP/1.0 and `Connection: close` already
+ *     mean). So a length that cannot be known in advance -- a log being
+ *     tailed, a report being generated -- no longer has to be buffered
+ *     just to be counted.
+ *   - Leave room in the header buffer for that header when relying on it.
  *   - The provider fills up to `buffer_size` bytes into `buffer` and
  *     returns the number written. Returning 0 signals end-of-body, so it
  *     must only be returned at true EOF (no transient short reads).

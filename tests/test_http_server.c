@@ -57,6 +57,7 @@
 #define PORT_DEFERRAL_CANCEL  4417
 #define PORT_BIND_LOOPBACK    4418
 #define PORT_BIND_MALFORMED   4419
+#define PORT_STREAM_UNSIZED   4420
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -1040,6 +1041,105 @@ static void http_server_streams_large_body_succeed(void** state)
 }
 
 /* ------------------------------------------------------------------------- *
+ * Streaming a body whose length is not known in advance.
+ *
+ * The point of the exercise is the case a Content-Length cannot describe: a
+ * log being tailed, a report being generated. Before chunked framing the
+ * only way to serve one was to buffer the whole thing just to count it, or
+ * to close the connection to say where it ended.
+ *
+ * The handler here deliberately sets NO Content-Length and the request is
+ * keep-alive, which is the combination that forces the server to frame the
+ * body itself.
+ * ------------------------------------------------------------------------- */
+static http_handler_outcome_t unsized_stream_handler(http_exchange_t* exchange,
+                                                     void* user_context)
+{
+    stream_ctx_t*    c            = (stream_ctx_t*)user_context;
+    http_response_t* out_response = http_exchange_response(exchange);
+
+    /* Header buffer supplied but left without a length on purpose. */
+    (void)http_headers_init(&out_response->headers,
+                            span_init(c->hdr_buf, sizeof(c->hdr_buf)));
+
+    out_response->code                  = HTTP_CODE_200;
+    out_response->reason_phrase         = HTTP_REASON_PHRASE_200;
+    out_response->body_provider         = stream_provider;
+    out_response->body_finalizer        = stream_finalizer;
+    out_response->body_provider_context = c;
+    return http_handler_respond;
+}
+
+static void http_server_streams_without_a_length_succeed(void** state)
+{
+    (void)state;
+
+    for (uint32_t i = 0; i < STREAM_BODY_SIZE; i++)
+    {
+        s_stream_payload[i] = (uint8_t)('a' + (i % 26));
+    }
+
+    stream_ctx_t ctx;
+    (void)memset(&ctx, 0, sizeof(ctx));
+    ctx.payload = s_stream_payload;
+    ctx.size    = STREAM_BODY_SIZE;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_STREAM_UNSIZED);
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/unsized$"),
+                                           unsized_stream_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_STREAM_UNSIZED);
+
+    /* Keep-alive: with Connection: close the server would be free to let the
+     * close delimit the body, and nothing would be chunked. */
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/unsized"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, false);
+
+    static uint8_t recv_buf[STREAM_BODY_SIZE + 512];
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      span_init(recv_buf, sizeof(recv_buf)),
+                                                      &response, NULL),
+                     ok);
+
+    assert_int_equal(span_compare(response.code, HTTP_CODE_200), 0);
+
+    /* The server chose the framing, so the header must say so -- otherwise a
+     * keep-alive peer has no way to know where this body ended. */
+    span_t encoding;
+    assert_int_equal(http_headers_find(&response.headers, HTTP_HEADER_TRANSFER_ENCODING,
+                                       &encoding), HL_RESULT_OK);
+    assert_int_equal(span_icompare(encoding, span_from_str_literal("chunked"), true), 0);
+
+    /* Dechunked by the client half, so this also proves the framing is
+     * well-formed rather than merely present. */
+    assert_int_equal(span_get_size(response.body), STREAM_BODY_SIZE);
+    assert_memory_equal(span_get_ptr(response.body), s_stream_payload, STREAM_BODY_SIZE);
+
+    client_disconnect(&client);
+
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+
+    assert_int_equal(ctx.bytes_sent, STREAM_BODY_SIZE);
+    assert_true(ctx.provider_calls >= 3);
+    assert_int_equal(ctx.finalize_calls, 1);
+}
+
+/* ------------------------------------------------------------------------- *
  * Deferred responses (http_exchange_defer / http_deferral_complete).
  *
  * The server is a single-threaded event loop, so before deferral a handler
@@ -1823,6 +1923,7 @@ int test_http_server()
         cmocka_unit_test(http_server_handles_parallel_clients_succeed),
         cmocka_unit_test(http_server_plain_http_GET_request_succeed),
         cmocka_unit_test(http_server_streams_large_body_succeed),
+        cmocka_unit_test(http_server_streams_without_a_length_succeed),
 
         /* Deferred responses */
         cmocka_unit_test(http_exchange_defer_on_null_yields_empty_ticket),

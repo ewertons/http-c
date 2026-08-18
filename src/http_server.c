@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -44,6 +45,13 @@ static void respond_with_status(http_server_connection_slot_t* slot,
 static const span_t HDR_CONNECTION = span_from_str_literal("Connection");
 static const span_t HDR_VAL_CLOSE  = span_from_str_literal("close");
 static const span_t HDR_VAL_ZERO   = span_from_str_literal("0");
+static const span_t HDR_CONTENT_LENGTH    = span_from_str_literal("Content-Length");
+static const span_t HDR_TRANSFER_ENCODING = span_from_str_literal("Transfer-Encoding");
+static const span_t HDR_VAL_CHUNKED       = span_from_str_literal("chunked");
+
+/* Room in front of each chunk for its size line. Eight hex digits covers a
+ * send buffer of any size this library can have, plus the CRLF. */
+#define CHUNK_HEADER_RESERVE 10u
 
 /* Monotonic milliseconds. CLOCK_MONOTONIC rather than CLOCK_REALTIME so a
  * wall-clock adjustment cannot make a deferral deadline fire early or
@@ -528,12 +536,37 @@ static void serialize_and_send(http_server_connection_slot_t* slot,
      * responsible for setting a correct Content-Length header. */
     if (response->body_provider != NULL)
     {
-        slot->stream_active    = true;
-        slot->stream_eof       = false;
-        slot->stream_provider  = response->body_provider;
-        slot->stream_finalizer = response->body_finalizer;
-        slot->stream_ctx       = response->body_provider_context;
-        response->body         = SPAN_EMPTY;
+        slot->stream_active     = true;
+        slot->stream_eof        = false;
+        slot->stream_chunked    = false;
+        slot->stream_terminated = false;
+        slot->stream_provider   = response->body_provider;
+        slot->stream_finalizer  = response->body_finalizer;
+        slot->stream_ctx        = response->body_provider_context;
+        response->body          = SPAN_EMPTY;
+
+        /* Without a length the peer has no way to know where the body
+         * ends. On a connection that is about to close, the close itself
+         * says so; on one that will be reused, only chunked framing can. */
+        span_t length;
+        if (http_headers_find(&response->headers, HDR_CONTENT_LENGTH, &length)
+                != HL_RESULT_OK &&
+            !slot->client_wants_close)
+        {
+            if (http_headers_add(&response->headers, HDR_TRANSFER_ENCODING,
+                                 HDR_VAL_CHUNKED) == HL_RESULT_OK)
+            {
+                slot->stream_chunked = true;
+            }
+            else
+            {
+                /* No room in the handler's header buffer. Falling back to
+                 * body-ends-at-close is correct on the wire; silently
+                 * keeping the connection alive would not be. */
+                log_error("stream: no room for Transfer-Encoding; closing after body");
+                slot->client_wants_close = true;
+            }
+        }
     }
 
     /* Serialise into the send buffer. */
@@ -659,15 +692,56 @@ static void slot_drive_send(http_server_connection_slot_t* slot)
          * chunk from the provider and keep sending; otherwise we're done. */
         if (slot->stream_active && !slot->stream_eof)
         {
+            /* Chunked framing writes a size line in front of the data and a
+             * CRLF behind it. The provider fills the middle, so the header
+             * is back-filled to end exactly where the data starts and
+             * nothing has to be moved afterwards. */
+            uint32_t reserve = slot->stream_chunked ? CHUNK_HEADER_RESERVE : 0u;
+            uint32_t room    = slot->send_buffer_size - reserve
+                             - (slot->stream_chunked ? 2u : 0u);
+
             uint32_t n = slot->stream_provider(slot->stream_ctx,
-                                               slot->send_buffer_ptr,
-                                               slot->send_buffer_size);
+                                               slot->send_buffer_ptr + reserve,
+                                               room);
             if (n > 0)
             {
-                slot->send_used   = n;
+                if (slot->stream_chunked)
+                {
+                    char head[16];
+                    int  head_size = snprintf(head, sizeof(head), "%X\r\n",
+                                              (unsigned int)n);
+                    if (head_size <= 0 || (uint32_t)head_size > reserve)
+                    {
+                        slot_close(slot);
+                        return;
+                    }
+                    uint32_t start = reserve - (uint32_t)head_size;
+                    (void)memcpy(slot->send_buffer_ptr + start, head,
+                                 (size_t)head_size);
+                    slot->send_buffer_ptr[reserve + n]      = (uint8_t)'\r';
+                    slot->send_buffer_ptr[reserve + n + 1u] = (uint8_t)'\n';
+                    slot->send_offset = start;
+                    slot->send_used   = reserve + n + 2u;
+                }
+                else
+                {
+                    slot->send_used   = n;
+                    slot->send_offset = 0;
+                }
+                continue;
+            }
+
+            /* End of body. A chunked one has to say so on the wire before
+             * the connection can carry anything else. */
+            if (slot->stream_chunked && !slot->stream_terminated)
+            {
+                slot->stream_terminated = true;
+                (void)memcpy(slot->send_buffer_ptr, "0\r\n\r\n", 5u);
+                slot->send_used   = 5u;
                 slot->send_offset = 0;
                 continue;
             }
+
             slot->stream_eof = true;
             stream_finalize(slot);
         }

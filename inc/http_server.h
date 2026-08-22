@@ -23,6 +23,13 @@
  * loses track of a handle would strand a connection slot forever. */
 #define HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS 30000
 
+/* How long a connection may go silent before the server closes it. Slots
+ * are a fixed, never-allocated resource, so an idle keep-alive costs
+ * exactly as much as a busy one: with no ceiling, clients that open
+ * connections and hold them can take every slot and the listener stops
+ * accepting -- alive, logging, and answering nobody. */
+#define HTTP_SERVER_DEFAULT_KEEP_ALIVE_TIMEOUT_MS 60000
+
 /* Forward declaration so the state-changed callback typedef below can
  * mention http_server_t* before the struct is defined. */
 struct http_server;
@@ -264,6 +271,13 @@ typedef struct http_server_connection_slot
     bool                  pending_ready;
     bool                  pending_cancelled;
     http_response_t       pending_response;
+
+    /* When this connection is closed for going silent. Refreshed every
+     * time bytes move in either direction, so it bounds SILENCE rather
+     * than duration -- a slow but progressing transfer is never cut off.
+     * Not consulted while the slot is parked on a deferral: that wait is
+     * the application's, and pending_deadline_ms already bounds it. */
+    uint64_t              idle_deadline_ms;
 } http_server_connection_slot_t;
 
 /* Caller-supplied storage. The library treats `slots` and `routes` as
@@ -307,6 +321,20 @@ typedef struct http_server_config
      * before the server answers 504 itself. 0 selects
      * #HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS. */
     uint32_t                        deferred_timeout_ms;
+
+    /* Optional. How long a connection may go silent -- no byte read and
+     * none written -- before the server closes it. 0 selects
+     * #HTTP_SERVER_DEFAULT_KEEP_ALIVE_TIMEOUT_MS.
+     *
+     * Covers the TLS handshake, a half-sent request, an idle keep-alive
+     * between requests, and a stalled response. It does NOT cover a
+     * deferred response: that wait belongs to the application and
+     * #deferred_timeout_ms already bounds it.
+     *
+     * Set UINT32_MAX for a server that must never drop an idle peer. HTTP
+     * clients are required to cope with a persistent connection being
+     * closed (RFC 7230 6.3.1), so that is rarely what you want. */
+    uint32_t                        keep_alive_timeout_ms;
 } http_server_config_t;
 
 struct http_server
@@ -336,6 +364,9 @@ struct http_server
      * is a leaf lock: never take `state_mutex` while holding it. */
     pthread_mutex_t                 pending_mutex;
     uint32_t                        pending_timeout_ms;
+
+    /* Cached from config; see http_server_config_t::keep_alive_timeout_ms. */
+    uint32_t                        keep_alive_timeout_ms;
 };
 
 static inline http_server_config_t http_server_get_default_config()

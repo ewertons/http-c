@@ -59,6 +59,10 @@
 #define PORT_BIND_MALFORMED   4419
 #define PORT_STREAM_UNSIZED   4420
 
+#define PORT_IDLE_CLOSE       4421
+#define PORT_IDLE_SLOT_REUSE  4422
+#define PORT_IDLE_HALF_REQ    4423
+#define PORT_IDLE_VS_DEFERRAL 4424
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
  * ------------------------------------------------------------------------- */
@@ -1890,6 +1894,328 @@ static void http_server_deferral_cancel_yields_503(void** state)
     deferred_ctx_destroy(&ctx);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Idle timeout.
+ *
+ * Raw sockets rather than the http_connection client: these tests need to
+ * send half a request, and to tell "the server closed us" (recv == 0)
+ * apart from "the read failed", which a parsed response cannot express.
+ * ------------------------------------------------------------------------- */
+
+static int raw_connect(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(fd >= 0);
+
+    struct sockaddr_in addr;
+    (void)memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);
+    assert_int_equal(inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr), 1);
+
+    assert_int_equal(connect(fd, (struct sockaddr*)&addr, sizeof(addr)), 0);
+    return fd;
+}
+
+static void raw_send(int fd, const char* text)
+{
+    size_t len = strlen(text);
+    assert_int_equal(send(fd, text, len, 0), (ssize_t)len);
+}
+
+/* Reads until the peer closes or `max_ms` elapses. Returns bytes read; 0
+ * means the server closed the connection without saying anything. */
+static ssize_t raw_read_until_close(int fd, char* out, size_t size, int max_ms)
+{
+    struct timeval tv;
+    tv.tv_sec  = max_ms / 1000;
+    tv.tv_usec = (max_ms % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    size_t used = 0;
+    for (;;)
+    {
+        ssize_t got = recv(fd, out + used, size - used - 1, 0);
+        if (got <= 0)
+        {
+            break;
+        }
+        used += (size_t)got;
+        if (used + 1 >= size)
+        {
+            break;
+        }
+    }
+    out[used] = '\0';
+    return (ssize_t)used;
+}
+
+static const char* GET_HELLO =
+    "GET /hello HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+/* Reads until the end of the response head, or `max_ms` elapses. Returns
+ * bytes read.
+ *
+ * Deliberately does NOT wait for the peer to close, unlike the helper
+ * above: when the idle ceiling is short the close IS the behaviour under
+ * test, so waiting for it here would release the very slot the caller is
+ * trying to hold. */
+static ssize_t raw_read_head(int fd, char* out, size_t size, int max_ms)
+{
+    struct timeval tv;
+    tv.tv_sec  = max_ms / 1000;
+    tv.tv_usec = (max_ms % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    size_t used = 0;
+    out[0] = '\0';
+    while (used + 1 < size)
+    {
+        ssize_t got = recv(fd, out + used, size - used - 1, 0);
+        if (got <= 0)
+        {
+            break;
+        }
+        used += (size_t)got;
+        out[used] = '\0';
+        if (strstr(out, "\r\n\r\n") != NULL)
+        {
+            break;
+        }
+    }
+    return (ssize_t)used;
+}
+
+/* An idle keep-alive costs a slot, and slots are the whole budget. Left
+ * alone, clients that connect and then say nothing take every one of them
+ * and the server stops accepting while still looking perfectly healthy. */
+static void http_server_closes_an_idle_keep_alive_connection(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_IDLE_CLOSE);
+    cfg.keep_alive_timeout_ms = 200;
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    handler_capture_t capture;
+    handler_capture_init(&capture);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/hello$"),
+                                           capturing_handler, &capture), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    int fd = raw_connect(PORT_IDLE_CLOSE);
+    raw_send(fd, GET_HELLO);
+
+    /* One good request first: the connection is proven working, so what
+     * the read below observes is the timeout and nothing else. */
+    char    buffer[1024];
+    ssize_t got = raw_read_until_close(fd, buffer, sizeof(buffer), 2000);
+    assert_true(got > 0);
+    assert_non_null(strstr(buffer, "HTTP/1.1 200"));
+
+    /* Now say nothing. The read returns 0 -- an orderly close -- rather
+     * than sitting here until the test's own timeout. */
+    assert_int_equal(raw_read_until_close(fd, buffer, sizeof(buffer), 2000), 0);
+
+    (void)close(fd);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    handler_capture_destroy(&capture);
+}
+
+/* The load-bearing one: reclaiming a slot is only worth anything if the
+ * listener comes back with it. Once every slot is taken the accept
+ * callback unregisters the listening socket, so a server that frees slots
+ * but never re-arms would stay just as unreachable. */
+static void http_server_idle_timeout_frees_slots_for_a_waiting_client(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_IDLE_SLOT_REUSE);
+    /* Generous enough that taking all four slots and connecting the fifth
+     * comfortably finishes before the first squatter expires. */
+    cfg.keep_alive_timeout_ms = 700;
+
+    /* The microcontroller preset is 4 slots, so "every slot taken" is
+     * four connections rather than 256. */
+    http_server_storage_t* storage = http_server_storage_get_for_microcontroller();
+    assert_non_null(storage);
+    assert_int_equal(http_server_init(&server, &cfg, storage), ok);
+    uint32_t slot_count = storage->slot_count;
+
+    handler_capture_t capture;
+    handler_capture_init(&capture);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/hello$"),
+                                           capturing_handler, &capture), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    /* Take every slot, and prove each one is really held: each squatter
+     * completes a request, so it is parked in keep-alive, not merely
+     * half-connected. */
+    int squatters[8];
+    assert_true(slot_count <= sizeofarray(squatters));
+    for (uint32_t i = 0; i < slot_count; i++)
+    {
+        squatters[i] = raw_connect(PORT_IDLE_SLOT_REUSE);
+        raw_send(squatters[i], GET_HELLO);
+
+        char buffer[1024];
+        assert_true(raw_read_head(squatters[i], buffer, sizeof(buffer), 2000) > 0);
+        assert_non_null(strstr(buffer, "HTTP/1.1 200"));
+    }
+
+    /* Nothing is left to accept this one, so the listener is unregistered
+     * and the request sits in the kernel backlog unanswered. */
+    int      latecomer = raw_connect(PORT_IDLE_SLOT_REUSE);
+    char     buffer[1024];
+    raw_send(latecomer, GET_HELLO);
+    assert_int_equal(raw_read_head(latecomer, buffer, sizeof(buffer), 150), 0);
+
+    /* Once the squatters time out their slots come back, the listener is
+     * re-armed, and the waiting request is finally served. */
+    assert_true(raw_read_head(latecomer, buffer, sizeof(buffer), 3000) > 0);
+    assert_non_null(strstr(buffer, "HTTP/1.1 200"));
+
+    (void)close(latecomer);
+    for (uint32_t i = 0; i < slot_count; i++)
+    {
+        (void)close(squatters[i]);
+    }
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    handler_capture_destroy(&capture);
+}
+
+/* Half a request is a different case from silence: this peer IS waiting
+ * for an answer, so it gets one it can read rather than a bare close it
+ * can only report as a network error. */
+static void http_server_half_sent_request_times_out_with_408(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_IDLE_HALF_REQ);
+    cfg.keep_alive_timeout_ms = 200;
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    handler_capture_t capture;
+    handler_capture_init(&capture);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/hello$"),
+                                           capturing_handler, &capture), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    int fd = raw_connect(PORT_IDLE_HALF_REQ);
+    /* No terminating blank line: the parser will want more for ever. */
+    raw_send(fd, "GET /hello HTTP/1.1\r\nHost: localhost\r\n");
+
+    char buffer[1024];
+    assert_true(raw_read_until_close(fd, buffer, sizeof(buffer), 2000) > 0);
+    assert_non_null(strstr(buffer, "HTTP/1.1 408"));
+
+    /* The handler must never have run -- the request was never complete. */
+    (void)pthread_mutex_lock(&capture.mutex);
+    bool invoked = capture.invoked;
+    (void)pthread_mutex_unlock(&capture.mutex);
+    assert_false(invoked);
+
+    (void)close(fd);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    handler_capture_destroy(&capture);
+}
+
+/* A parked deferral looks exactly like an idle connection from the
+ * outside: no bytes either way. It is not one -- the wait belongs to the
+ * application and deferred_timeout_ms already bounds it. Killing it here
+ * would break every slow handler the deferral mechanism exists for. */
+static void http_server_idle_timeout_spares_a_parked_deferral(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_IDLE_VS_DEFERRAL);
+    /* Idle ceiling far shorter than the work takes. */
+    cfg.keep_alive_timeout_ms = 150;
+    cfg.deferred_timeout_ms   = 5000;
+
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    deferred_ctx_t ctx;
+    deferred_ctx_init(&ctx, &server);
+
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/slow$"),
+                                           deferring_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    task_t* responder = task_run(deferred_responder, &ctx);
+    assert_non_null(responder);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_IDLE_VS_DEFERRAL);
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/slow"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    assert_true(wait_for_deferral(&ctx, 2000));
+
+    /* Sit silent for several idle ceilings before answering. */
+    task_sleep_ms(600);
+
+    (void)pthread_mutex_lock(&ctx.mutex);
+    ctx.release = true;
+    (void)pthread_mutex_unlock(&ctx.mutex);
+
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL), ok);
+    assert_int_equal(span_compare(response.code, HTTP_CODE_200), 0);
+    assert_int_equal(span_compare(response.body, DEFERRED_BODY), 0);
+
+    assert_true(task_wait(responder));
+    task_release(responder);
+    assert_int_equal(ctx.respond_result, ok);
+
+    client_disconnect(&client);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    deferred_ctx_destroy(&ctx);
+}
+
 /* ------------------------------------------------------------------------- */
 
 int test_http_server()
@@ -1934,6 +2260,12 @@ int test_http_server()
         cmocka_unit_test(http_server_oversize_request_returns_413),
         cmocka_unit_test(http_server_handler_close_drops_connection),
         cmocka_unit_test(http_server_deferral_cancel_yields_503),
+
+        /* Idle timeout */
+        cmocka_unit_test(http_server_closes_an_idle_keep_alive_connection),
+        cmocka_unit_test(http_server_idle_timeout_frees_slots_for_a_waiting_client),
+        cmocka_unit_test(http_server_half_sent_request_times_out_with_408),
+        cmocka_unit_test(http_server_idle_timeout_spares_a_parked_deferral),
 
         /* Client-side chunked decoding */
         cmocka_unit_test(http_client_decodes_chunked_response),

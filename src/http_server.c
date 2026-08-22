@@ -86,6 +86,16 @@ static void server_set_state(http_server_t* server, http_server_state_t s)
     }
 }
 
+/* Push this connection's idle deadline out. Called wherever bytes move,
+ * so what is bounded is silence, not how long a peer is allowed to stay. */
+static void slot_touch(http_server_connection_slot_t* slot)
+{
+    if (slot->server != NULL)
+    {
+        slot->idle_deadline_ms = now_ms() + (uint64_t)slot->server->keep_alive_timeout_ms;
+    }
+}
+
 /* Returns NULL if no slot is available. */
 static http_server_connection_slot_t* acquire_slot(http_server_t* server)
 {
@@ -114,6 +124,7 @@ static http_server_connection_slot_t* acquire_slot(http_server_t* server)
             slot->pending_ready       = false;
             slot->pending_cancelled   = false;
             slot->pending_deadline_ms = 0;
+            slot->idle_deadline_ms    = 0;
             (void)memset(&slot->connection, 0, sizeof(slot->connection));
             return slot;
         }
@@ -379,6 +390,7 @@ static void slot_drive_receive(http_server_connection_slot_t* slot)
         }
 
         slot->recv_used += got;
+        slot_touch(slot);
 
         span_t buf = span_init(slot->recv_buffer_ptr, slot->recv_used);
         result_t pr = http_request_parser_feed(&slot->parser, buf);
@@ -522,6 +534,11 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
 static void serialize_and_send(http_server_connection_slot_t* slot,
                                http_response_t*              response)
 {
+    /* A deferral may have been parked for far longer than the idle
+     * ceiling; the wait was the application's and legitimate. Restart the
+     * clock here so the answer is not cut off before it is written. */
+    slot_touch(slot);
+
     /* If the handler supplied a streaming body, remember it on the slot and
      * serialise only the head (status line + headers). The body is then
      * pulled from the provider as the send buffer drains. The handler is
@@ -640,6 +657,10 @@ static void slot_drive_send(http_server_connection_slot_t* slot)
             uint32_t written = 0;
             result_t r = socket_write_nb(&slot->connection.socket, to_send, &written);
             slot->send_offset += written;
+            if (written > 0)
+            {
+                slot_touch(slot);
+            }
 
             if (r == ok)
             {
@@ -825,6 +846,51 @@ static void sweep_pending_deadlines(http_server_t* server)
     }
 }
 
+/* Close connections that have gone silent. A slot costs the same whether
+ * it is working or not, and there are only ever slot_count of them, so
+ * without this a handful of clients holding open connections they never
+ * use takes the whole server off the air: the listener is unregistered
+ * once the last slot is taken and nothing ever gives one back.
+ *
+ * Deliberately does not touch http_slot_state_pending -- that wait is the
+ * application's, and sweep_pending_deadlines already bounds it. */
+static void sweep_idle_slots(http_server_t* server)
+{
+    uint64_t now = now_ms();
+
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+
+        if (!slot->in_use ||
+            slot->state == http_slot_state_idle ||
+            slot->state == http_slot_state_pending)
+        {
+            continue;
+        }
+
+        if (now >= slot->idle_deadline_ms)
+        {
+            if (slot->state == http_slot_state_receiving && slot->recv_used > 0)
+            {
+                /* Mid-request. The peer IS waiting for an answer, so say
+                 * what happened instead of dropping it as an unexplained
+                 * network error. */
+                slot->client_wants_close = true;
+                respond_with_status(slot, HTTP_CODE_408, HTTP_REASON_PHRASE_408);
+                continue;
+            }
+
+            /* Nothing in flight -- an idle keep-alive, or a handshake that
+             * never got anywhere. Nobody is waiting on a response, and
+             * before the handshake completes there is no way to send one.
+             * Closing bumps the generation, so anything still holding a
+             * ticket for this slot lands as not_found. */
+            slot_close(slot);
+        }
+    }
+}
+
 /* How long the loop may sleep. With nothing parked we block indefinitely
  * and rely on event_loop_wake() from a completion; with something parked
  * we must surface in time to enforce its deadline. */
@@ -837,13 +903,33 @@ static int next_tick_ms(http_server_t* server)
     for (uint32_t i = 0; i < server->storage->slot_count; i++)
     {
         http_server_connection_slot_t* slot = &server->storage->slots[i];
-        if (slot->in_use && slot->state == http_slot_state_pending)
+        if (!slot->in_use)
         {
-            if (!any || slot->pending_deadline_ms < soonest)
-            {
-                soonest = slot->pending_deadline_ms;
-                any     = true;
-            }
+            continue;
+        }
+
+        /* Whichever deadline applies to this slot's state. An idle
+         * connection wakes the loop just like a parked deferral does --
+         * without that the loop blocks indefinitely and the sweep only
+         * runs when some other connection happens to make noise. */
+        uint64_t deadline;
+        if (slot->state == http_slot_state_pending)
+        {
+            deadline = slot->pending_deadline_ms;
+        }
+        else if (slot->state != http_slot_state_idle)
+        {
+            deadline = slot->idle_deadline_ms;
+        }
+        else
+        {
+            continue;
+        }
+
+        if (!any || deadline < soonest)
+        {
+            soonest = deadline;
+            any     = true;
         }
     }
     (void)pthread_mutex_unlock(&server->pending_mutex);
@@ -1021,6 +1107,9 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
     server->pending_timeout_ms = (config->deferred_timeout_ms != 0)
                                     ? config->deferred_timeout_ms
                                     : HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS;
+    server->keep_alive_timeout_ms = (config->keep_alive_timeout_ms != 0)
+                                    ? config->keep_alive_timeout_ms
+                                    : HTTP_SERVER_DEFAULT_KEEP_ALIVE_TIMEOUT_MS;
 
     for (uint32_t i = 0; i < storage->slot_count; i++)
     {
@@ -1034,6 +1123,7 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
         storage->slots[i].pending_ready       = false;
         storage->slots[i].pending_cancelled   = false;
         storage->slots[i].pending_deadline_ms = 0;
+        storage->slots[i].idle_deadline_ms    = 0;
     }
     for (uint32_t i = 0; i < storage->route_count; i++)
     {
@@ -1182,6 +1272,10 @@ static void on_listen_readable(int fd, uint32_t events, void* user)
 
     slot->connection.endpoint = &server->local_endpoint;
     slot->state               = http_slot_state_handshaking;
+    /* Start the clock at accept, so a peer that connects and then says
+     * nothing at all -- never completing the TLS handshake -- is bounded
+     * too, not just one that goes quiet later. */
+    slot_touch(slot);
     /* Drive the handshake immediately. SSL_do_handshake will report
      * WANT_READ/WANT_WRITE if it cannot complete synchronously. */
     slot_drive_handshake(slot);
@@ -1263,6 +1357,7 @@ result_t http_server_run(http_server_t* server)
         }
         flush_pending_responses(server);
         sweep_pending_deadlines(server);
+        sweep_idle_slots(server);
     }
 
     /* Tear down: close any in-flight connections and unregister fds. */

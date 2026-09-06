@@ -434,6 +434,7 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
 
     bool                   method_matched = false;
     bool                   route_matched  = false;
+    bool                   defer_requested = false;
     http_handler_outcome_t outcome        = http_handler_respond;
 
     for (uint32_t i = 0; i < server->route_count; i++)
@@ -466,6 +467,7 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
             exchange.defer_requested = false;
 
             outcome = route->handler(&exchange, route->user_context);
+            defer_requested = exchange.defer_requested;
 
             if (outcome != http_handler_defer && exchange.defer_requested)
             {
@@ -475,6 +477,15 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
                  * `return http_handler_defer`, and silent otherwise. */
                 log_error("handler took a deferral but returned outcome %d",
                           (int)outcome);
+
+                (void)pthread_mutex_lock(&server->pending_mutex);
+                if (slot->in_use && slot->state == http_slot_state_pending)
+                {
+                    slot->pending_ready     = false;
+                    slot->pending_cancelled = false;
+                    slot->state             = http_slot_state_receiving;
+                }
+                (void)pthread_mutex_unlock(&server->pending_mutex);
             }
 
             route_matched = true;
@@ -498,12 +509,15 @@ static void run_handler_and_serialize(http_server_connection_slot_t* slot,
             /* Nothing to serialise yet. Park the connection; read interest
              * stays armed so a peer that goes away is noticed immediately
              * rather than at the deferral deadline. */
-            (void)pthread_mutex_lock(&server->pending_mutex);
-            slot->pending_ready       = false;
-            slot->pending_cancelled   = false;
-            slot->pending_deadline_ms = now_ms() + (uint64_t)server->pending_timeout_ms;
-            slot->state               = http_slot_state_pending;
-            (void)pthread_mutex_unlock(&server->pending_mutex);
+            if (!defer_requested)
+            {
+                (void)pthread_mutex_lock(&server->pending_mutex);
+                slot->pending_ready       = false;
+                slot->pending_cancelled   = false;
+                slot->pending_deadline_ms = now_ms() + (uint64_t)server->pending_timeout_ms;
+                slot->state               = http_slot_state_pending;
+                (void)pthread_mutex_unlock(&server->pending_mutex);
+            }
             slot_arm(slot, event_loop_event_read);
             return;
         }
@@ -1045,6 +1059,17 @@ http_deferral_t http_exchange_defer(http_exchange_t* exchange)
      * and then forgot to return http_handler_defer -- otherwise the
      * eventual completion is silently rejected as stale. */
     exchange->defer_requested = true;
+
+    http_server_t* server = slot->server;
+    (void)pthread_mutex_lock(&server->pending_mutex);
+    if (slot->in_use && slot->state != http_slot_state_pending)
+    {
+        slot->pending_ready       = false;
+        slot->pending_cancelled   = false;
+        slot->pending_deadline_ms = now_ms() + (uint64_t)server->pending_timeout_ms;
+        slot->state               = http_slot_state_pending;
+    }
+    (void)pthread_mutex_unlock(&server->pending_mutex);
 
     deferral.server     = slot->server;
     deferral.slot       = slot;

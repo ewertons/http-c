@@ -63,6 +63,7 @@
 #define PORT_IDLE_SLOT_REUSE  4422
 #define PORT_IDLE_HALF_REQ    4423
 #define PORT_IDLE_VS_DEFERRAL 4424
+#define PORT_DEFERRED_EARLY    4425
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
  * ------------------------------------------------------------------------- */
@@ -1233,6 +1234,30 @@ static bool wait_for_release(deferred_ctx_t* ctx, int max_ms)
 
 static const span_t DEFERRED_BODY = span_from_str_literal("deferred-hello");
 
+static http_handler_outcome_t early_deferring_handler(http_exchange_t* exchange,
+                                                       void* user)
+{
+    deferred_ctx_t* ctx = (deferred_ctx_t*)user;
+    http_deferral_t deferral = http_exchange_defer(exchange);
+
+    http_response_t response;
+    (void)memset(&response, 0, sizeof(response));
+    response.http_version  = HTTP_VERSION_1_1;
+    response.code          = HTTP_CODE_200;
+    response.reason_phrase = HTTP_REASON_PHRASE_200;
+
+    (void)http_headers_init(&ctx->headers,
+                            span_init(ctx->header_storage, sizeof(ctx->header_storage)));
+    span_t length = span_copy_int32(span_init(ctx->length_storage,
+                                              sizeof(ctx->length_storage)),
+                                    (int32_t)span_get_size(DEFERRED_BODY), NULL);
+    (void)http_headers_add(&ctx->headers, HTTP_HEADER_CONTENT_LENGTH, length);
+    response.headers = ctx->headers;
+    response.body    = DEFERRED_BODY;
+    ctx->respond_result = http_deferral_complete(deferral, &response);
+    return http_handler_defer;
+}
+
 static result_t deferred_responder(void* state, task_t* self)
 {
     (void)self;
@@ -1328,6 +1353,47 @@ static void http_exchange_defer_on_null_yields_empty_ticket(void** state)
     http_deferral_t deferral = http_exchange_defer(NULL);
     assert_null(deferral.server);
     assert_null(deferral.slot);
+}
+
+static void http_server_accepts_completion_before_handler_returns(void** state)
+{
+    (void)state;
+
+    http_server_t server;
+    http_server_config_t cfg;
+    server_set_plain(&cfg, PORT_DEFERRED_EARLY);
+    assert_int_equal(http_server_init(&server, &cfg,
+                                      http_server_storage_get_for_server_host()), ok);
+
+    deferred_ctx_t ctx;
+    deferred_ctx_init(&ctx, &server);
+    assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/early$"),
+                                           early_deferring_handler, &ctx), ok);
+
+    task_t* run_task = http_server_run_async(&server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+
+    test_client_t client;
+    client_connect_plain(&client, PORT_DEFERRED_EARLY);
+    send_simple_request(&client, HTTP_METHOD_GET, span_from_str_literal("/early"),
+                        HTTP_VERSION_1_1, SPAN_EMPTY, true);
+
+    http_response_t response;
+    assert_int_equal(http_connection_receive_response(&client.connection,
+                                                      client_buffer(&client),
+                                                      &response, NULL), ok);
+    assert_int_equal(span_compare(response.code, HTTP_CODE_200), 0);
+    assert_int_equal(span_compare(response.body, DEFERRED_BODY), 0);
+    assert_int_equal(ctx.respond_result, ok);
+
+    client_disconnect(&client);
+    assert_int_equal(http_server_stop(&server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(&server), ok);
+    deferred_ctx_destroy(&ctx);
 }
 
 static void http_server_deferred_response_from_worker_thread_succeed(void** state)
@@ -2254,6 +2320,7 @@ int test_http_server()
         /* Deferred responses */
         cmocka_unit_test(http_exchange_defer_on_null_yields_empty_ticket),
         cmocka_unit_test(http_deferral_rejects_invalid_tickets),
+        cmocka_unit_test(http_server_accepts_completion_before_handler_returns),
         cmocka_unit_test(http_server_deferred_response_from_worker_thread_succeed),
         cmocka_unit_test(http_server_deferred_response_times_out_with_504),
         cmocka_unit_test(http_server_deferred_handle_stale_after_disconnect),

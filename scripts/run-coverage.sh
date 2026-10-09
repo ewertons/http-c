@@ -41,7 +41,17 @@ command -v gcovr >/dev/null 2>&1 || {
 # number understates the true exercised surface.
 # ---------------------------------------------------------------------------
 CERT_DIR="/tmp/http-c-certs"
-if [[ ! -f "${CERT_DIR}/server/server.cert.pem" ]]; then
+# Re-minted when any is missing or within a day of expiring: they are only
+# valid for 30 days, and an expired set fails socket_connect in every TLS test
+# while looking exactly like a code regression.
+certs_current() {
+    local cert
+    for cert in ca/chain.ca.cert.pem server/server.cert.pem client/client.cert.pem; do
+        [[ -f "${CERT_DIR}/${cert}" ]] || return 1
+        openssl x509 -checkend 86400 -noout -in "${CERT_DIR}/${cert}" >/dev/null 2>&1 || return 1
+    done
+}
+if ! certs_current; then
     echo "==> Provisioning TLS test certs under ${CERT_DIR}"
     mkdir -p "${CERT_DIR}/ca" "${CERT_DIR}/client" "${CERT_DIR}/server"
 

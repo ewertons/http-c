@@ -77,6 +77,7 @@ typedef struct test_client
 
 static void server_set_default_tls(http_server_config_t* cfg, int port)
 {
+    assert_tls_fixtures_current();
     *cfg = http_server_get_default_config();
     cfg->port = port;
     cfg->tls.certificate_file = SERVER_CERT_PATH;
@@ -279,6 +280,139 @@ static http_handler_outcome_t noop_handler(http_exchange_t* e, void* u)
 }
 
 /* ------------------------------------------------------------------------- *
+ * What a failed test leaves running.
+ *
+ * cmocka leaves a failed test by longjmp, so the stop-and-wait at the end of
+ * its body never runs. The server -- or worker -- it started kept running
+ * against that body's stack frame, which the next test reuses: an expired
+ * TLS fixture turned seven clean failures into a segfault, and into a run
+ * that never exits, because task_platform_deinit waits for every task.
+ *
+ * So whatever those threads can reach is static, every thread a test starts
+ * is recorded here, and the teardown every test in this file runs -- cmocka
+ * runs it after a failure too -- stops and waits for whatever is still
+ * going before the next test begins.
+ * ------------------------------------------------------------------------- */
+#define MAX_RUNNING 4
+
+typedef struct running
+{
+    task_t*        task;
+    http_server_t* server;   /* stopped and deinitialized with it, or NULL */
+    int            port;     /* knocked on to release an accept(), or 0 */
+} running_t;
+
+static running_t s_running[MAX_RUNNING];
+
+static void running_add(task_t* task, http_server_t* server, int port)
+{
+    for (int i = 0; task != NULL && i < MAX_RUNNING; i++)
+    {
+        if (s_running[i].task == NULL)
+        {
+            s_running[i].task   = task;
+            s_running[i].server = server;
+            s_running[i].port   = port;
+            return;
+        }
+    }
+    /* Not fail_msg: the thread is already running, and leaving now is the
+     * very thing this exists to prevent. */
+    print_error("more than %d threads in one test; raise MAX_RUNNING\n", MAX_RUNNING);
+}
+
+static task_t* start_server(http_server_t* server)
+{
+    task_t* task = http_server_run_async(server);
+    running_add(task, server, 0);
+    return task;
+}
+
+static task_t* start_worker(task_function_t function, void* context, int port)
+{
+    task_t* task = task_run(function, context);
+    running_add(task, NULL, port);
+    return task;
+}
+
+/* task_release, for a thread started above: it has ended. */
+static void finish(task_t* task)
+{
+    for (int i = 0; i < MAX_RUNNING; i++)
+    {
+        if (s_running[i].task == task)
+        {
+            s_running[i].task = NULL;
+        }
+    }
+    task_release(task);
+}
+
+static void knock(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return;
+    }
+    struct sockaddr_in address;
+    (void)memset(&address, 0, sizeof(address));
+    address.sin_family      = AF_INET;
+    address.sin_port        = htons((uint16_t)port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    (void)connect(fd, (struct sockaddr*)&address, sizeof(address));
+    (void)close(fd);
+}
+
+static int stop_what_is_still_running(void** state)
+{
+    (void)state;
+    int result = 0;
+
+    for (int i = 0; i < MAX_RUNNING; i++)
+    {
+        running_t* running = &s_running[i];
+        if (running->task == NULL || task_is_completed(running->task))
+        {
+            continue;
+        }
+        if (running->server != NULL)
+        {
+            (void)http_server_stop(running->server);
+        }
+        if (running->port != 0)
+        {
+            knock(running->port);
+        }
+    }
+
+    for (int i = 0; i < MAX_RUNNING; i++)
+    {
+        running_t* running = &s_running[i];
+        if (running->task == NULL)
+        {
+            continue;
+        }
+        if (!task_wait_timeout(running->task, 10000))
+        {
+            /* Still using what it was given, so none of it is torn down. */
+            print_error("a thread this test started did not stop\n");
+            result = -1;
+            continue;
+        }
+        task_release(running->task);
+        if (running->server != NULL)
+        {
+            (void)http_server_deinit(running->server);
+        }
+        (void)memset(running, 0, sizeof(*running));
+    }
+    return result;
+}
+
+#define server_test(f) cmocka_unit_test_teardown(f, stop_what_is_still_running)
+
+/* ------------------------------------------------------------------------- *
  *                              Negative tests
  * ------------------------------------------------------------------------- */
 
@@ -292,14 +426,14 @@ static void http_server_init_NULL_server_fails(void** state)
 static void http_server_init_NULL_config_fails(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     assert_int_equal(http_server_init(&server, NULL, http_server_storage_get_for_server_host()), invalid_argument);
 }
 
 static void http_server_init_NULL_storage_fails(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     assert_int_equal(http_server_init(&server, &cfg, NULL), invalid_argument);
 }
@@ -322,7 +456,7 @@ static void http_server_add_route_NULL_server_fails(void** state)
 static void http_server_add_route_empty_method_fails(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
@@ -337,7 +471,7 @@ static void http_server_add_route_empty_method_fails(void** state)
 static void http_server_add_route_empty_path_fails(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
@@ -351,7 +485,7 @@ static void http_server_add_route_empty_path_fails(void** state)
 static void http_server_add_route_NULL_handler_fails(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
@@ -366,7 +500,7 @@ static void http_server_add_route_NULL_handler_fails(void** state)
 static void http_server_add_route_overflow_fails(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
@@ -405,7 +539,7 @@ static void http_server_stop_NULL_fails(void** state)
 static void http_server_init_and_deinit_succeed(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     cfg.tls.certificate_file = SERVER_CERT_PATH;
     cfg.tls.private_key_file = SERVER_PK_PATH;
@@ -416,7 +550,7 @@ static void http_server_init_and_deinit_succeed(void** state)
 static void http_server_add_multiple_routes_succeed(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg = http_server_get_default_config();
     assert_int_equal(http_server_init(&server, &cfg, http_server_storage_get_for_server_host()), ok);
 
@@ -439,7 +573,7 @@ static void http_server_add_multiple_routes_succeed(void** state)
 static void http_server_run_lifecycle_succeed(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_RUN_LIFECYCLE);
 
@@ -448,7 +582,7 @@ static void http_server_run_lifecycle_succeed(void** state)
                                            span_from_str_literal("^/$"),
                                            noop_handler, NULL), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
 
     /* Allow the run loop to enter the running state. */
@@ -457,7 +591,7 @@ static void http_server_run_lifecycle_succeed(void** state)
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
     assert_true(task_is_completed(run_task));
-    task_release(run_task);
+    finish(run_task);
 
     assert_int_equal(http_server_deinit(&server), ok);
 }
@@ -469,7 +603,7 @@ static void http_server_run_lifecycle_succeed(void** state)
 static void http_server_bind_address_loopback_listens(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_BIND_LOOPBACK);
     cfg.bind_address = "127.0.0.1";
@@ -479,7 +613,7 @@ static void http_server_bind_address_loopback_listens(void** state)
                                            span_from_str_literal("^/$"),
                                            noop_handler, NULL), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -491,7 +625,7 @@ static void http_server_bind_address_loopback_listens(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
 
     assert_int_equal(http_server_deinit(&server), ok);
 }
@@ -499,7 +633,7 @@ static void http_server_bind_address_loopback_listens(void** state)
 static void http_server_bind_address_malformed_fails_to_run(void** state)
 {
     (void)state;
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_BIND_MALFORMED);
     cfg.bind_address = "not-an-address";
@@ -517,10 +651,10 @@ static void http_server_bind_address_malformed_fails_to_run(void** state)
 static void http_server_handles_GET_request_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;    handler_capture_init(&handler);
+    static handler_capture_t handler;    handler_capture_init(&handler);
     handler.response_body = span_from_str_literal("hello");
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_HANDLE_GET);
 
@@ -529,7 +663,7 @@ static void http_server_handles_GET_request_succeed(void** state)
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -558,7 +692,7 @@ static void http_server_handles_GET_request_succeed(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -566,12 +700,12 @@ static void http_server_handles_GET_request_succeed(void** state)
 static void http_server_handles_POST_with_body_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
     handler.response_code   = HTTP_CODE_201;
     handler.response_reason = HTTP_REASON_PHRASE_201;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_HANDLE_POST);
 
@@ -580,7 +714,7 @@ static void http_server_handles_POST_with_body_succeed(void** state)
                                            span_from_str_literal("^/api/items$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -610,7 +744,7 @@ static void http_server_handles_POST_with_body_succeed(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -618,10 +752,10 @@ static void http_server_handles_POST_with_body_succeed(void** state)
 static void http_server_path_captures_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_PATH_CAPTURES);
 
@@ -630,7 +764,7 @@ static void http_server_path_captures_succeed(void** state)
                                            span_from_str_literal("^/cars/([^/]+)/([^/]+)$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -658,7 +792,7 @@ static void http_server_path_captures_succeed(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -666,10 +800,10 @@ static void http_server_path_captures_succeed(void** state)
 static void http_server_returns_404_for_unknown_path(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_NOT_FOUND);
 
@@ -678,7 +812,7 @@ static void http_server_returns_404_for_unknown_path(void** state)
                                            span_from_str_literal("^/exists$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -702,7 +836,7 @@ static void http_server_returns_404_for_unknown_path(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -710,10 +844,10 @@ static void http_server_returns_404_for_unknown_path(void** state)
 static void http_server_returns_405_for_method_mismatch(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_METHOD_MISMATCH);
 
@@ -723,7 +857,7 @@ static void http_server_returns_405_for_method_mismatch(void** state)
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -747,7 +881,7 @@ static void http_server_returns_405_for_method_mismatch(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -755,11 +889,11 @@ static void http_server_returns_405_for_method_mismatch(void** state)
 static void http_server_keep_alive_multiple_requests_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
     handler.count_invocations = true;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_KEEP_ALIVE);
 
@@ -768,7 +902,7 @@ static void http_server_keep_alive_multiple_requests_succeed(void** state)
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -803,7 +937,7 @@ static void http_server_keep_alive_multiple_requests_succeed(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -811,11 +945,11 @@ static void http_server_keep_alive_multiple_requests_succeed(void** state)
 static void http_server_handles_parallel_clients_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
     handler.count_invocations = true;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_default_tls(&cfg, PORT_PARALLEL);
 
@@ -824,7 +958,7 @@ static void http_server_handles_parallel_clients_succeed(void** state)
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -868,7 +1002,7 @@ static void http_server_handles_parallel_clients_succeed(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -881,11 +1015,11 @@ static void http_server_handles_parallel_clients_succeed(void** state)
 static void http_server_plain_http_GET_request_succeed(void** state)
 {
     (void)state;
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
     handler.response_body = span_from_str_literal("plain-hello");
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_PLAIN_HTTP);
 
@@ -894,7 +1028,7 @@ static void http_server_plain_http_GET_request_succeed(void** state)
                                            span_from_str_literal("^/$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -920,7 +1054,7 @@ static void http_server_plain_http_GET_request_succeed(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -994,12 +1128,12 @@ static void http_server_streams_large_body_succeed(void** state)
         s_stream_payload[i] = (uint8_t)('A' + (i % 26));
     }
 
-    stream_ctx_t ctx;
+    static stream_ctx_t ctx;
     (void)memset(&ctx, 0, sizeof(ctx));
     ctx.payload = s_stream_payload;
     ctx.size    = STREAM_BODY_SIZE;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_STREAM_BODY);
 
@@ -1008,7 +1142,7 @@ static void http_server_streams_large_body_succeed(void** state)
                                            span_from_str_literal("^/stream$"),
                                            streaming_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1035,7 +1169,7 @@ static void http_server_streams_large_body_succeed(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
 
     /* Delivered in multiple chunks (20 KB over an 8 KB send buffer) and the
@@ -1084,12 +1218,12 @@ static void http_server_streams_without_a_length_succeed(void** state)
         s_stream_payload[i] = (uint8_t)('a' + (i % 26));
     }
 
-    stream_ctx_t ctx;
+    static stream_ctx_t ctx;
     (void)memset(&ctx, 0, sizeof(ctx));
     ctx.payload = s_stream_payload;
     ctx.size    = STREAM_BODY_SIZE;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_STREAM_UNSIZED);
 
@@ -1099,7 +1233,7 @@ static void http_server_streams_without_a_length_succeed(void** state)
                                            span_from_str_literal("^/unsized$"),
                                            unsized_stream_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1136,7 +1270,7 @@ static void http_server_streams_without_a_length_succeed(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
 
     assert_int_equal(ctx.bytes_sent, STREAM_BODY_SIZE);
@@ -1308,7 +1442,7 @@ static void http_deferral_rejects_invalid_tickets(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_DEFERRED_BOGUS);
     assert_int_equal(http_server_init(&server, &cfg,
@@ -1359,19 +1493,19 @@ static void http_server_accepts_completion_before_handler_returns(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_DEFERRED_EARLY);
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    deferred_ctx_t ctx;
+    static deferred_ctx_t ctx;
     deferred_ctx_init(&ctx, &server);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/early$"),
                                            early_deferring_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1391,7 +1525,7 @@ static void http_server_accepts_completion_before_handler_returns(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     deferred_ctx_destroy(&ctx);
 }
@@ -1400,17 +1534,17 @@ static void http_server_deferred_response_from_worker_thread_succeed(void** stat
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_DEFERRED_OK);
 
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    deferred_ctx_t ctx;
+    static deferred_ctx_t ctx;
     deferred_ctx_init(&ctx, &server);
 
-    handler_capture_t immediate;
+    static handler_capture_t immediate;
     handler_capture_init(&immediate);
     immediate.response_body = span_from_str_literal("immediate");
 
@@ -1421,11 +1555,11 @@ static void http_server_deferred_response_from_worker_thread_succeed(void** stat
                                            span_from_str_literal("^/fast$"),
                                            capturing_handler, &immediate), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
-    task_t* responder = task_run(deferred_responder, &ctx);
+    task_t* responder = start_worker(deferred_responder, &ctx, 0);
     assert_non_null(responder);
 
     test_client_t slow_client;
@@ -1468,7 +1602,7 @@ static void http_server_deferred_response_from_worker_thread_succeed(void** stat
     assert_int_equal(span_compare(slow_response.body, DEFERRED_BODY), 0);
 
     assert_true(task_wait(responder));
-    task_release(responder);
+    finish(responder);
 
     assert_int_equal(ctx.respond_result, ok);
 
@@ -1477,7 +1611,7 @@ static void http_server_deferred_response_from_worker_thread_succeed(void** stat
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&immediate);
     deferred_ctx_destroy(&ctx);
@@ -1487,7 +1621,7 @@ static void http_server_deferred_response_times_out_with_504(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_DEFERRED_TIMEOUT);
     /* Short ceiling so the test does not sit out the 30s default. */
@@ -1496,14 +1630,14 @@ static void http_server_deferred_response_times_out_with_504(void** state)
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    deferred_ctx_t ctx;
+    static deferred_ctx_t ctx;
     deferred_ctx_init(&ctx, &server);
 
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/never$"),
                                            deferring_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1535,7 +1669,7 @@ static void http_server_deferred_response_times_out_with_504(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     deferred_ctx_destroy(&ctx);
 }
@@ -1544,7 +1678,7 @@ static void http_server_deferred_handle_stale_after_disconnect(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_DEFERRED_STALE);
     /* Long ceiling: the disconnect must be what invalidates the handle,
@@ -1554,14 +1688,14 @@ static void http_server_deferred_handle_stale_after_disconnect(void** state)
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    deferred_ctx_t ctx;
+    static deferred_ctx_t ctx;
     deferred_ctx_init(&ctx, &server);
 
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/abandon$"),
                                            deferring_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1587,7 +1721,7 @@ static void http_server_deferred_handle_stale_after_disconnect(void** state)
 
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     deferred_ctx_destroy(&ctx);
 }
@@ -1604,11 +1738,11 @@ static void http_server_oversize_request_returns_413(void** state)
      * SIGPIPE and take the whole test binary down. */
     (void)signal(SIGPIPE, SIG_IGN);
 
-    handler_capture_t handler;
+    static handler_capture_t handler;
     handler_capture_init(&handler);
     handler.response_body = span_from_str_literal("never");
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_OVERSIZE);
 
@@ -1618,7 +1752,7 @@ static void http_server_oversize_request_returns_413(void** state)
                                            span_from_str_literal("^/big$"),
                                            capturing_handler, &handler), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1647,7 +1781,7 @@ static void http_server_oversize_request_returns_413(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&handler);
 }
@@ -1813,13 +1947,13 @@ static void http_client_decodes_chunked_response(void** state)
     (void)state;
     (void)signal(SIGPIPE, SIG_IGN);
 
-    raw_server_ctx_t ctx;
+    static raw_server_ctx_t ctx;
     ctx.port      = PORT_CHUNKED;
     ctx.listening = false;
     assert_int_equal(pthread_mutex_init(&ctx.mutex, NULL), 0);
     assert_int_equal(pthread_cond_init(&ctx.cond, NULL), 0);
 
-    task_t* server_task = task_run(raw_chunked_server, &ctx);
+    task_t* server_task = start_worker(raw_chunked_server, &ctx, PORT_CHUNKED);
     assert_non_null(server_task);
 
     assert_true(raw_server_wait_listening(&ctx, 2000));
@@ -1842,7 +1976,7 @@ static void http_client_decodes_chunked_response(void** state)
 
     client_disconnect(&client);
     assert_true(task_wait(server_task));
-    task_release(server_task);
+    finish(server_task);
 
     (void)pthread_cond_destroy(&ctx.cond);
     (void)pthread_mutex_destroy(&ctx.mutex);
@@ -1865,9 +1999,10 @@ static void http_server_handler_close_drops_connection(void** state)
     (void)state;
     (void)signal(SIGPIPE, SIG_IGN);
 
-    bool invoked = false;
+    static bool invoked;
+    invoked = false;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_HANDLER_CLOSE);
 
@@ -1877,7 +2012,7 @@ static void http_server_handler_close_drops_connection(void** state)
                                            span_from_str_literal("^/drop$"),
                                            closing_handler, &invoked), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -1896,7 +2031,7 @@ static void http_server_handler_close_drops_connection(void** state)
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
 }
 
@@ -1904,7 +2039,7 @@ static void http_server_deferral_cancel_yields_503(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_DEFERRAL_CANCEL);
     /* Long ceiling: the cancel must be what answers, not the sweep. */
@@ -1913,7 +2048,7 @@ static void http_server_deferral_cancel_yields_503(void** state)
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    deferred_ctx_t ctx;
+    static deferred_ctx_t ctx;
     deferred_ctx_init(&ctx, &server);
     ctx.cancel_instead = true;
 
@@ -1921,11 +2056,11 @@ static void http_server_deferral_cancel_yields_503(void** state)
                                            span_from_str_literal("^/giveup$"),
                                            deferring_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
-    task_t* responder = task_run(deferred_responder, &ctx);
+    task_t* responder = start_worker(deferred_responder, &ctx, 0);
     assert_non_null(responder);
 
     test_client_t client;
@@ -1949,13 +2084,13 @@ static void http_server_deferral_cancel_yields_503(void** state)
     assert_default_response_is_framed(&response);
 
     assert_true(task_wait(responder));
-    task_release(responder);
+    finish(responder);
     assert_int_equal(ctx.respond_result, ok);
 
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     deferred_ctx_destroy(&ctx);
 }
@@ -2059,7 +2194,7 @@ static void http_server_closes_an_idle_keep_alive_connection(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_IDLE_CLOSE);
     cfg.keep_alive_timeout_ms = 200;
@@ -2067,13 +2202,13 @@ static void http_server_closes_an_idle_keep_alive_connection(void** state)
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    handler_capture_t capture;
+    static handler_capture_t capture;
     handler_capture_init(&capture);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/hello$"),
                                            capturing_handler, &capture), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -2094,7 +2229,7 @@ static void http_server_closes_an_idle_keep_alive_connection(void** state)
     (void)close(fd);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&capture);
 }
@@ -2107,7 +2242,7 @@ static void http_server_idle_timeout_frees_slots_for_a_waiting_client(void** sta
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_IDLE_SLOT_REUSE);
     /* Generous enough that taking all four slots and connecting the fifth
@@ -2121,13 +2256,13 @@ static void http_server_idle_timeout_frees_slots_for_a_waiting_client(void** sta
     assert_int_equal(http_server_init(&server, &cfg, storage), ok);
     uint32_t slot_count = storage->slot_count;
 
-    handler_capture_t capture;
+    static handler_capture_t capture;
     handler_capture_init(&capture);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/hello$"),
                                            capturing_handler, &capture), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -2165,7 +2300,7 @@ static void http_server_idle_timeout_frees_slots_for_a_waiting_client(void** sta
     }
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&capture);
 }
@@ -2177,7 +2312,7 @@ static void http_server_half_sent_request_times_out_with_408(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_IDLE_HALF_REQ);
     cfg.keep_alive_timeout_ms = 200;
@@ -2185,13 +2320,13 @@ static void http_server_half_sent_request_times_out_with_408(void** state)
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    handler_capture_t capture;
+    static handler_capture_t capture;
     handler_capture_init(&capture);
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/hello$"),
                                            capturing_handler, &capture), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
@@ -2212,7 +2347,7 @@ static void http_server_half_sent_request_times_out_with_408(void** state)
     (void)close(fd);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     handler_capture_destroy(&capture);
 }
@@ -2225,7 +2360,7 @@ static void http_server_idle_timeout_spares_a_parked_deferral(void** state)
 {
     (void)state;
 
-    http_server_t server;
+    static http_server_t server;
     http_server_config_t cfg;
     server_set_plain(&cfg, PORT_IDLE_VS_DEFERRAL);
     /* Idle ceiling far shorter than the work takes. */
@@ -2235,18 +2370,18 @@ static void http_server_idle_timeout_spares_a_parked_deferral(void** state)
     assert_int_equal(http_server_init(&server, &cfg,
                                       http_server_storage_get_for_server_host()), ok);
 
-    deferred_ctx_t ctx;
+    static deferred_ctx_t ctx;
     deferred_ctx_init(&ctx, &server);
 
     assert_int_equal(http_server_add_route(&server, HTTP_METHOD_GET,
                                            span_from_str_literal("^/slow$"),
                                            deferring_handler, &ctx), ok);
 
-    task_t* run_task = http_server_run_async(&server);
+    task_t* run_task = start_server(&server);
     assert_non_null(run_task);
     task_sleep_ms(50);
 
-    task_t* responder = task_run(deferred_responder, &ctx);
+    task_t* responder = start_worker(deferred_responder, &ctx, 0);
     assert_non_null(responder);
 
     test_client_t client;
@@ -2271,13 +2406,13 @@ static void http_server_idle_timeout_spares_a_parked_deferral(void** state)
     assert_int_equal(span_compare(response.body, DEFERRED_BODY), 0);
 
     assert_true(task_wait(responder));
-    task_release(responder);
+    finish(responder);
     assert_int_equal(ctx.respond_result, ok);
 
     client_disconnect(&client);
     assert_int_equal(http_server_stop(&server), ok);
     assert_true(task_wait(run_task));
-    task_release(run_task);
+    finish(run_task);
     assert_int_equal(http_server_deinit(&server), ok);
     deferred_ctx_destroy(&ctx);
 }
@@ -2288,54 +2423,54 @@ int test_http_server()
 {
     const struct CMUnitTest tests[] = {
         /* Negative */
-        cmocka_unit_test(http_server_init_NULL_server_fails),
-        cmocka_unit_test(http_server_init_NULL_config_fails),
-        cmocka_unit_test(http_server_init_NULL_storage_fails),
-        cmocka_unit_test(http_server_deinit_NULL_fails),
-        cmocka_unit_test(http_server_add_route_NULL_server_fails),
-        cmocka_unit_test(http_server_add_route_empty_method_fails),
-        cmocka_unit_test(http_server_add_route_empty_path_fails),
-        cmocka_unit_test(http_server_add_route_NULL_handler_fails),
-        cmocka_unit_test(http_server_add_route_overflow_fails),
-        cmocka_unit_test(http_server_run_NULL_fails),
-        cmocka_unit_test(http_server_stop_NULL_fails),
+        server_test(http_server_init_NULL_server_fails),
+        server_test(http_server_init_NULL_config_fails),
+        server_test(http_server_init_NULL_storage_fails),
+        server_test(http_server_deinit_NULL_fails),
+        server_test(http_server_add_route_NULL_server_fails),
+        server_test(http_server_add_route_empty_method_fails),
+        server_test(http_server_add_route_empty_path_fails),
+        server_test(http_server_add_route_NULL_handler_fails),
+        server_test(http_server_add_route_overflow_fails),
+        server_test(http_server_run_NULL_fails),
+        server_test(http_server_stop_NULL_fails),
 
         /* Positive */
-        cmocka_unit_test(http_server_init_and_deinit_succeed),
-        cmocka_unit_test(http_server_add_multiple_routes_succeed),
-        cmocka_unit_test(http_server_run_lifecycle_succeed),
-        cmocka_unit_test(http_server_bind_address_loopback_listens),
-        cmocka_unit_test(http_server_bind_address_malformed_fails_to_run),
-        cmocka_unit_test(http_server_handles_GET_request_succeed),
-        cmocka_unit_test(http_server_handles_POST_with_body_succeed),
-        cmocka_unit_test(http_server_path_captures_succeed),
-        cmocka_unit_test(http_server_returns_404_for_unknown_path),
-        cmocka_unit_test(http_server_returns_405_for_method_mismatch),
-        cmocka_unit_test(http_server_keep_alive_multiple_requests_succeed),
-        cmocka_unit_test(http_server_handles_parallel_clients_succeed),
-        cmocka_unit_test(http_server_plain_http_GET_request_succeed),
-        cmocka_unit_test(http_server_streams_large_body_succeed),
-        cmocka_unit_test(http_server_streams_without_a_length_succeed),
+        server_test(http_server_init_and_deinit_succeed),
+        server_test(http_server_add_multiple_routes_succeed),
+        server_test(http_server_run_lifecycle_succeed),
+        server_test(http_server_bind_address_loopback_listens),
+        server_test(http_server_bind_address_malformed_fails_to_run),
+        server_test(http_server_handles_GET_request_succeed),
+        server_test(http_server_handles_POST_with_body_succeed),
+        server_test(http_server_path_captures_succeed),
+        server_test(http_server_returns_404_for_unknown_path),
+        server_test(http_server_returns_405_for_method_mismatch),
+        server_test(http_server_keep_alive_multiple_requests_succeed),
+        server_test(http_server_handles_parallel_clients_succeed),
+        server_test(http_server_plain_http_GET_request_succeed),
+        server_test(http_server_streams_large_body_succeed),
+        server_test(http_server_streams_without_a_length_succeed),
 
         /* Deferred responses */
-        cmocka_unit_test(http_exchange_defer_on_null_yields_empty_ticket),
-        cmocka_unit_test(http_deferral_rejects_invalid_tickets),
-        cmocka_unit_test(http_server_accepts_completion_before_handler_returns),
-        cmocka_unit_test(http_server_deferred_response_from_worker_thread_succeed),
-        cmocka_unit_test(http_server_deferred_response_times_out_with_504),
-        cmocka_unit_test(http_server_deferred_handle_stale_after_disconnect),
-        cmocka_unit_test(http_server_oversize_request_returns_413),
-        cmocka_unit_test(http_server_handler_close_drops_connection),
-        cmocka_unit_test(http_server_deferral_cancel_yields_503),
+        server_test(http_exchange_defer_on_null_yields_empty_ticket),
+        server_test(http_deferral_rejects_invalid_tickets),
+        server_test(http_server_accepts_completion_before_handler_returns),
+        server_test(http_server_deferred_response_from_worker_thread_succeed),
+        server_test(http_server_deferred_response_times_out_with_504),
+        server_test(http_server_deferred_handle_stale_after_disconnect),
+        server_test(http_server_oversize_request_returns_413),
+        server_test(http_server_handler_close_drops_connection),
+        server_test(http_server_deferral_cancel_yields_503),
 
         /* Idle timeout */
-        cmocka_unit_test(http_server_closes_an_idle_keep_alive_connection),
-        cmocka_unit_test(http_server_idle_timeout_frees_slots_for_a_waiting_client),
-        cmocka_unit_test(http_server_half_sent_request_times_out_with_408),
-        cmocka_unit_test(http_server_idle_timeout_spares_a_parked_deferral),
+        server_test(http_server_closes_an_idle_keep_alive_connection),
+        server_test(http_server_idle_timeout_frees_slots_for_a_waiting_client),
+        server_test(http_server_half_sent_request_times_out_with_408),
+        server_test(http_server_idle_timeout_spares_a_parked_deferral),
 
         /* Client-side chunked decoding */
-        cmocka_unit_test(http_client_decodes_chunked_response),
+        server_test(http_client_decodes_chunked_response),
     };
 
     return cmocka_run_group_tests_name("http_server", tests, NULL, NULL);

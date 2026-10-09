@@ -66,16 +66,97 @@ static void http_endpoint_init_listener_succeed(void** state)
     assert_int_equal(http_endpoint_deinit(&local_endpoint), ok);
 }
 
+/* What http_endpoint_client_and_server_succeed leaves behind when it fails.
+ *
+ * cmocka leaves a failed test by longjmp, and the accept task was handed a
+ * connection on that test's stack: a handshake that failed (an expired
+ * fixture is enough) had it write into a frame the next test was using.
+ * Static, and ended by the teardown -- which cmocka runs after a failure
+ * too -- before anything else runs. */
+#define CLIENT_AND_SERVER_PORT 4344
+
+static http_endpoint_t   s_server_endpoint;
+static http_endpoint_t   s_client_endpoint;
+static http_connection_t s_server_connection;
+static http_connection_t s_client_connection;
+static bool              s_server_initialized;
+static bool              s_client_initialized;
+static bool              s_server_accepted;
+static bool              s_client_connected;
+static task_t*           s_accept_task;
+
+/* An accept still waiting returns once something connects. */
+static void knock(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+        return;
+    }
+    struct sockaddr_in address;
+    (void)memset(&address, 0, sizeof(address));
+    address.sin_family      = AF_INET;
+    address.sin_port        = htons((uint16_t)port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    (void)connect(fd, (struct sockaddr*)&address, sizeof(address));
+    (void)close(fd);
+}
+
+static int end_client_and_server(void** state)
+{
+    (void)state;
+
+    if (s_accept_task != NULL)
+    {
+        if (!task_is_completed(s_accept_task))
+        {
+            knock(CLIENT_AND_SERVER_PORT);
+        }
+        if (!task_wait_timeout(s_accept_task, 10000))
+        {
+            /* Still using the endpoint, so nothing it can reach is torn down. */
+            print_error("the accept task did not end\n");
+            return -1;
+        }
+        s_server_accepted = task_get_result(s_accept_task) == ok;
+        task_release(s_accept_task);
+        s_accept_task = NULL;
+    }
+    /* Only what was really opened: a connection never made holds descriptor
+     * 0, and closing that is the bug a test below exists to catch. */
+    if (s_client_connected)
+    {
+        (void)http_connection_close(&s_client_connection);
+        s_client_connected = false;
+    }
+    if (s_server_accepted)
+    {
+        (void)http_connection_close(&s_server_connection);
+        s_server_accepted = false;
+    }
+    if (s_client_initialized)
+    {
+        (void)http_endpoint_deinit(&s_client_endpoint);
+        s_client_initialized = false;
+    }
+    if (s_server_initialized)
+    {
+        (void)http_endpoint_deinit(&s_server_endpoint);
+        s_server_initialized = false;
+    }
+    return 0;
+}
+
 static void http_endpoint_client_and_server_succeed(void** state)
 {
     (void)state;
-    http_endpoint_t server_endpoint;
+    assert_tls_fixtures_current();
+
     http_endpoint_config_t server_endpoint_config = http_endpoint_get_default_secure_server_config();
-    server_endpoint_config.local.port = 4344;
+    server_endpoint_config.local.port = CLIENT_AND_SERVER_PORT;
     server_endpoint_config.tls.certificate_file = SERVER_CERT_PATH;
     server_endpoint_config.tls.private_key_file = SERVER_PK_PATH;
 
-    http_endpoint_t client_endpoint;
     http_endpoint_config_t client_endpoint_config = http_endpoint_get_default_secure_client_config();
     client_endpoint_config.remote.hostname = span_from_str_literal("localhost");
     client_endpoint_config.remote.port = server_endpoint_config.local.port;
@@ -83,20 +164,27 @@ static void http_endpoint_client_and_server_succeed(void** state)
     client_endpoint_config.tls.private_key_file = CLIENT_PK_PATH;
     client_endpoint_config.tls.trusted_certificate_file = CA_CHAIN_PATH;
 
-    assert_int_equal(http_endpoint_init(&server_endpoint, &server_endpoint_config), ok);
+    (void)memset(&s_server_connection, 0, sizeof(s_server_connection));
+    (void)memset(&s_client_connection, 0, sizeof(s_client_connection));
 
-    assert_int_equal(http_endpoint_init(&client_endpoint, &client_endpoint_config), ok);
+    assert_int_equal(http_endpoint_init(&s_server_endpoint, &server_endpoint_config), ok);
+    s_server_initialized = true;
 
-    http_connection_t server_connection;
-    task_t* wait_for_connection_task = http_endpoint_wait_for_connection_async(&server_endpoint, &server_connection);
+    assert_int_equal(http_endpoint_init(&s_client_endpoint, &client_endpoint_config), ok);
+    s_client_initialized = true;
 
-    http_connection_t client_connection;
-    assert_int_equal(http_endpoint_connect(&client_endpoint, &client_connection), ok);
+    s_accept_task = http_endpoint_wait_for_connection_async(&s_server_endpoint, &s_server_connection);
 
-    assert_true(task_wait(wait_for_connection_task));
-    assert_true(task_is_completed(wait_for_connection_task));
-    assert_int_equal(task_get_result(wait_for_connection_task), ok);
-    task_release(wait_for_connection_task);
+    assert_int_equal(http_endpoint_connect(&s_client_endpoint, &s_client_connection), ok);
+    s_client_connected = true;
+
+    assert_true(task_wait(s_accept_task));
+    assert_true(task_is_completed(s_accept_task));
+    s_server_accepted = task_get_result(s_accept_task) == ok;
+    task_release(s_accept_task);
+    s_accept_task = NULL;
+    assert_true(s_server_accepted);
+
 
     span_t test_buffer = span_from_memory(test_raw_buffer);
 
@@ -111,9 +199,9 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_USER_AGENT, HTTP_HEADER_USER_AGENT_VALUE), HL_RESULT_OK);
     assert_int_equal(http_headers_add(&outgoing_request_headers, HTTP_HEADER_CONNECTION, HTTP_HEADER_CONNECTION_VALUE), HL_RESULT_OK);
     assert_int_equal(http_request_initialize(&outgoing_request, HTTP_METHOD_GET, span_from_str_literal("/"), HTTP_VERSION_1_1, outgoing_request_headers), ok);
-    assert_int_equal(http_connection_send_request(&client_connection, &outgoing_request), ok);
+    assert_int_equal(http_connection_send_request(&s_client_connection, &outgoing_request), ok);
 
-    assert_int_equal(http_connection_receive_request(&server_connection, test_buffer, &incoming_request, NULL), ok);
+    assert_int_equal(http_connection_receive_request(&s_server_connection, test_buffer, &incoming_request, NULL), ok);
     assert_int_equal(span_compare(incoming_request.method, HTTP_METHOD_GET), 0);
     assert_int_equal(span_compare(incoming_request.path, span_from_str_literal("/")), 0);
     assert_int_equal(span_compare(incoming_request.http_version, HTTP_VERSION_1_1), 0);
@@ -136,9 +224,9 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(http_headers_add(&outgoing_response_headers, HTTP_HEADER_CONTENT_LENGTH, HTTP_HEADER_CONTENT_LENGTH_VALUE), HL_RESULT_OK);
     assert_int_equal(http_response_initialize(&outgoing_response, HTTP_VERSION_1_1, HTTP_CODE_200, HTTP_REASON_PHRASE_200, outgoing_response_headers), ok);
     outgoing_response.body = HTTP_RESPONSE_BODY;
-    assert_int_equal(http_connection_send_response(&server_connection, &outgoing_response), ok);
+    assert_int_equal(http_connection_send_response(&s_server_connection, &outgoing_response), ok);
 
-    assert_int_equal(http_connection_receive_response(&client_connection, test_buffer, &incoming_response, NULL), ok);
+    assert_int_equal(http_connection_receive_response(&s_client_connection, test_buffer, &incoming_response, NULL), ok);
     assert_int_equal(span_compare(incoming_response.http_version, HTTP_VERSION_1_1), 0);
     assert_int_equal(span_compare(incoming_response.code, HTTP_CODE_200), 0);
     assert_int_equal(span_compare(incoming_response.reason_phrase, HTTP_REASON_PHRASE_200), 0);
@@ -154,10 +242,14 @@ static void http_endpoint_client_and_server_succeed(void** state)
     assert_int_equal(span_compare(header_value, HTTP_HEADER_CONTENT_LENGTH_VALUE), 0);
     assert_int_equal(http_headers_get_next(&incoming_response.headers, &header_name, &header_value), HL_RESULT_EOF);
 
-    assert_int_equal(http_connection_close(&client_connection), ok);
-    assert_int_equal(http_connection_close(&server_connection), ok);
-    assert_int_equal(http_endpoint_deinit(&client_endpoint), ok);
-    assert_int_equal(http_endpoint_deinit(&server_endpoint), ok);
+    s_client_connected = false;
+    s_server_accepted  = false;
+    s_client_initialized = false;
+    s_server_initialized = false;
+    assert_int_equal(http_connection_close(&s_client_connection), ok);
+    assert_int_equal(http_connection_close(&s_server_connection), ok);
+    assert_int_equal(http_endpoint_deinit(&s_client_endpoint), ok);
+    assert_int_equal(http_endpoint_deinit(&s_server_endpoint), ok);
 }
 
 /* Restoring stdin has to be a fixture, not tail code: cmocka leaves a failed
@@ -346,7 +438,7 @@ int test_http_endpoint()
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(http_endpoint_init_listener_succeed),
-    cmocka_unit_test(http_endpoint_client_and_server_succeed),
+    cmocka_unit_test_teardown(http_endpoint_client_and_server_succeed, end_client_and_server),
     cmocka_unit_test_setup_teardown(http_endpoint_client_deinit_leaves_descriptor_zero_open,
                                     save_stdin, restore_stdin),
     cmocka_unit_test(http_connection_read_gives_up_on_a_silent_peer),

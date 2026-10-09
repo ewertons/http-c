@@ -21,9 +21,14 @@ add_executable(${TARGET_NAME}
                 test_http_server.c
                 test_http_endpoint.c
                 test_http_server_storage.c
+                tls_fixtures.c
 )
 
 target_link_libraries(${TARGET_NAME} http-c common-lib-c cmocka pthread)
+# tls_fixtures.c reads the certificates itself; without a TLS backend it is empty.
+if(NOT COMMON_LIB_C_TLS_BACKEND STREQUAL "NONE")
+    target_link_libraries(${TARGET_NAME} ssl crypto)
+endif()
 
 add_test(${TARGET_NAME} ${TARGET_NAME})
 

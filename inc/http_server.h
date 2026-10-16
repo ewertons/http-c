@@ -23,6 +23,23 @@
  * loses track of a handle would strand a connection slot forever. */
 #define HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS 30000
 
+/* How long a connection may go without progress -- no bytes in or out --
+ * while the server waits on the peer (TLS handshake, reading a request,
+ * or writing a response) before it is closed. Slots are a fixed resource;
+ * without a ceiling, a client that opens a socket and never speaks (a
+ * browser's speculative preconnect, an idle keep-alive, a stalled reader)
+ * holds its slot for the life of the process. */
+#define HTTP_SERVER_DEFAULT_IDLE_TIMEOUT_MS 30000
+
+/* When every slot is busy and another client connects, a connection that
+ * is idle between requests -- nothing buffered, no response in flight --
+ * for at least this long is closed to make room. The floor keeps a client
+ * polling in a tight loop from losing its connection between two requests
+ * it is about to send. */
+#ifndef HTTP_SERVER_RECLAIM_MIN_IDLE_MS
+#define HTTP_SERVER_RECLAIM_MIN_IDLE_MS 1000
+#endif
+
 /* Forward declaration so the state-changed callback typedef below can
  * mention http_server_t* before the struct is defined. */
 struct http_server;
@@ -255,6 +272,10 @@ typedef struct http_server_connection_slot
      * at most one response in flight, so one inline slot is exactly
      * enough. Fields below are guarded by http_server_t::pending_mutex. */
     uint32_t              generation;
+    /* Loop-thread only. Last time the connection made progress: accepted,
+     * handshake completed, bytes read or written, or a keep-alive response
+     * finished. Drives the idle timeout and idle-slot reclaim. */
+    uint64_t              last_activity_ms;
     uint64_t              pending_deadline_ms;
     bool                  pending_ready;
     bool                  pending_cancelled;
@@ -302,6 +323,13 @@ typedef struct http_server_config
      * before the server answers 504 itself. 0 selects
      * #HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS. */
     uint32_t                        deferred_timeout_ms;
+
+    /* Optional. How long a connection may make no progress while the
+     * server waits on the peer before it is closed; see
+     * #HTTP_SERVER_DEFAULT_IDLE_TIMEOUT_MS. 0 selects that default;
+     * UINT32_MAX effectively disables the timeout. Deferred responses are
+     * governed by deferred_timeout_ms instead. */
+    uint32_t                        idle_timeout_ms;
 } http_server_config_t;
 
 struct http_server
@@ -331,6 +359,9 @@ struct http_server
      * is a leaf lock: never take `state_mutex` while holding it. */
     pthread_mutex_t                 pending_mutex;
     uint32_t                        pending_timeout_ms;
+
+    /* Cached from config at init time. Loop-thread only. */
+    uint32_t                        idle_timeout_ms;
 };
 
 static inline http_server_config_t http_server_get_default_config()

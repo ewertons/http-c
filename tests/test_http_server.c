@@ -11,6 +11,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
+#include <time.h>
+#include <errno.h>
 
 #include <cmocka.h>
 
@@ -57,6 +60,10 @@
 #define PORT_DEFERRAL_CANCEL  4417
 #define PORT_BIND_LOOPBACK    4418
 #define PORT_BIND_MALFORMED   4419
+#define PORT_IDLE_TIMEOUT     4420
+#define PORT_RECLAIM_IDLE     4421
+#define PORT_RECLAIM_BUSY     4422
+#define PORT_RECLAIM_LATER    4423
 
 /* ------------------------------------------------------------------------- *
  * Fixture helpers.
@@ -1790,6 +1797,256 @@ static void http_server_deferral_cancel_yields_503(void** state)
     deferred_ctx_destroy(&ctx);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Idle timeout and idle-slot reclaim.
+ *
+ * Plain sockets rather than the http_connection client: these tests are
+ * about what the server does with a connection that says nothing, which
+ * the client API has no way to express.
+ * ------------------------------------------------------------------------- */
+
+#define SMALL_SLOT_COUNT 2
+
+static http_server_connection_slot_t s_small_slots[SMALL_SLOT_COUNT];
+static http_route_t                  s_small_routes[4];
+static uint8_t                       s_small_recv[SMALL_SLOT_COUNT][1024];
+static uint8_t                       s_small_send[SMALL_SLOT_COUNT][1024];
+static http_server_storage_t         s_small_storage;
+
+/* A two-slot server, so "every slot busy" takes two clients. */
+static http_server_storage_t* small_storage(void)
+{
+    (void)memset(s_small_slots, 0, sizeof(s_small_slots));
+    (void)memset(s_small_routes, 0, sizeof(s_small_routes));
+    for (unsigned i = 0; i < SMALL_SLOT_COUNT; i++)
+    {
+        s_small_slots[i].recv_buffer_ptr  = s_small_recv[i];
+        s_small_slots[i].recv_buffer_size = sizeof(s_small_recv[i]);
+        s_small_slots[i].send_buffer_ptr  = s_small_send[i];
+        s_small_slots[i].send_buffer_size = sizeof(s_small_send[i]);
+    }
+    s_small_storage.slots       = s_small_slots;
+    s_small_storage.slot_count  = SMALL_SLOT_COUNT;
+    s_small_storage.routes      = s_small_routes;
+    s_small_storage.route_count = 4;
+    return &s_small_storage;
+}
+
+/* Keep-alive request for a path no route matches: the server answers a
+ * framed, bodiless 404 itself, so a response is exactly one header block. */
+static const char KEEP_ALIVE_REQUEST[] = "GET /nothing-here HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+static int raw_connect(int port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(fd >= 0);
+    struct sockaddr_in addr;
+    (void)memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert_int_equal(connect(fd, (struct sockaddr*)&addr, sizeof(addr)), 0);
+    return fd;
+}
+
+static void raw_send(int fd, const char* text)
+{
+    size_t len = strlen(text);
+    assert_int_equal(send(fd, text, len, MSG_NOSIGNAL), (ssize_t)len);
+}
+
+/* 1 once a whole response head has arrived, 0 if the peer closed first,
+ * -1 if neither happened within timeout_ms. */
+static int raw_read_response(int fd, int timeout_ms)
+{
+    char   buf[512];
+    size_t used = 0;
+    while (timeout_ms > 0)
+    {
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        int r = poll(&p, 1, 10);
+        timeout_ms -= 10;
+        if (r <= 0)
+        {
+            continue;
+        }
+        ssize_t n = recv(fd, buf + used, sizeof(buf) - 1 - used, 0);
+        if (n <= 0)
+        {
+            return 0;
+        }
+        used += (size_t)n;
+        buf[used] = '\0';
+        if (strstr(buf, "\r\n\r\n") != NULL)
+        {
+            return 1;
+        }
+    }
+    return -1;
+}
+
+/* Whether the server closed the connection within timeout_ms. */
+static bool raw_closed_within(int fd, int timeout_ms)
+{
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    if (poll(&p, 1, timeout_ms) <= 0)
+    {
+        return false;
+    }
+    char    c;
+    ssize_t n = recv(fd, &c, 1, MSG_DONTWAIT);
+    return n == 0 || (n < 0 && errno == ECONNRESET);
+}
+
+static uint64_t test_now_ms(void)
+{
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+static task_t* start_plain_server(http_server_t*         server,
+                                  int                    port,
+                                  uint32_t               idle_timeout_ms,
+                                  http_server_storage_t* storage)
+{
+    http_server_config_t cfg;
+    server_set_plain(&cfg, port);
+    cfg.idle_timeout_ms = idle_timeout_ms;
+    assert_int_equal(http_server_init(server, &cfg, storage), ok);
+    assert_int_equal(http_server_add_route(server, HTTP_METHOD_GET,
+                                           span_from_str_literal("^/exists$"),
+                                           noop_handler, NULL), ok);
+    task_t* run_task = http_server_run_async(server);
+    assert_non_null(run_task);
+    task_sleep_ms(50);
+    return run_task;
+}
+
+static void stop_server(http_server_t* server, task_t* run_task)
+{
+    assert_int_equal(http_server_stop(server), ok);
+    assert_true(task_wait(run_task));
+    task_release(run_task);
+    assert_int_equal(http_server_deinit(server), ok);
+}
+
+/* A socket that never speaks, and a keep-alive connection after its last
+ * request, both used to hold their slot for the life of the process. */
+static void http_server_idle_connection_times_out(void** state)
+{
+    (void)state;
+    http_server_t server;
+    task_t* run_task = start_plain_server(&server, PORT_IDLE_TIMEOUT, 300,
+                                          http_server_storage_get_for_server_host());
+
+    uint64_t start  = test_now_ms();
+    int      silent = raw_connect(PORT_IDLE_TIMEOUT);
+    assert_true(raw_closed_within(silent, 3000));
+    uint64_t waited = test_now_ms() - start;
+    assert_true(waited >= 250);   /* closed by the timeout, not on sight */
+
+    int kept = raw_connect(PORT_IDLE_TIMEOUT);
+    raw_send(kept, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(kept, 2000), 1);
+    assert_true(raw_closed_within(kept, 3000));
+
+    (void)close(silent);
+    (void)close(kept);
+    stop_server(&server, run_task);
+}
+
+/* With every slot held by an idle keep-alive connection, a new client is
+ * admitted by closing the longest-idle one -- and only that one. */
+static void http_server_reclaims_idle_slot_when_full(void** state)
+{
+    (void)state;
+    http_server_t server;
+    task_t* run_task = start_plain_server(&server, PORT_RECLAIM_IDLE, 60000, small_storage());
+
+    int a = raw_connect(PORT_RECLAIM_IDLE);
+    raw_send(a, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(a, 2000), 1);
+    task_sleep_ms(100);
+    int b = raw_connect(PORT_RECLAIM_IDLE);
+    raw_send(b, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(b, 2000), 1);
+
+    task_sleep_ms(HTTP_SERVER_RECLAIM_MIN_IDLE_MS + 200);
+
+    int c = raw_connect(PORT_RECLAIM_IDLE);
+    raw_send(c, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(c, 1000), 1);
+
+    assert_true(raw_closed_within(a, 1000));     /* oldest went */
+    assert_false(raw_closed_within(b, 200));     /* the other stayed */
+    raw_send(b, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(b, 2000), 1);
+
+    (void)close(a);
+    (void)close(b);
+    (void)close(c);
+    stop_server(&server, run_task);
+}
+
+/* A connection partway through a request is not idle and is never
+ * reclaimed; the newcomer waits until the idle timeout frees a slot. */
+static void http_server_does_not_reclaim_busy_slots(void** state)
+{
+    (void)state;
+    http_server_t server;
+    task_t* run_task = start_plain_server(&server, PORT_RECLAIM_BUSY, 1500, small_storage());
+
+    int a = raw_connect(PORT_RECLAIM_BUSY);
+    int b = raw_connect(PORT_RECLAIM_BUSY);
+    raw_send(a, "GET /nothing-here HTTP/1.1\r\nHost: loc");
+    raw_send(b, "GET /nothing-here HTTP/1.1\r\nHost: loc");
+
+    task_sleep_ms(HTTP_SERVER_RECLAIM_MIN_IDLE_MS + 200);
+
+    int c = raw_connect(PORT_RECLAIM_BUSY);
+    raw_send(c, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(c, 150), -1);   /* still queued */
+    assert_int_equal(raw_read_response(c, 3000), 1);   /* admitted after the timeout */
+    assert_true(raw_closed_within(a, 1000));
+    assert_true(raw_closed_within(b, 1000));
+
+    (void)close(a);
+    (void)close(b);
+    (void)close(c);
+    stop_server(&server, run_task);
+}
+
+/* A client that arrives while every slot has just been used waits only
+ * until a slot has been idle for HTTP_SERVER_RECLAIM_MIN_IDLE_MS -- not
+ * for the full idle timeout. Covers the loop waking itself to reclaim. */
+static void http_server_admits_waiting_client_once_a_slot_goes_idle(void** state)
+{
+    (void)state;
+    http_server_t server;
+    task_t* run_task = start_plain_server(&server, PORT_RECLAIM_LATER, 60000, small_storage());
+
+    int a = raw_connect(PORT_RECLAIM_LATER);
+    int b = raw_connect(PORT_RECLAIM_LATER);
+    raw_send(a, KEEP_ALIVE_REQUEST);
+    raw_send(b, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(a, 2000), 1);
+    assert_int_equal(raw_read_response(b, 2000), 1);
+
+    uint64_t start = test_now_ms();
+    int      c     = raw_connect(PORT_RECLAIM_LATER);
+    raw_send(c, KEEP_ALIVE_REQUEST);
+    assert_int_equal(raw_read_response(c, 3000), 1);
+    uint64_t waited = test_now_ms() - start;
+    assert_true(waited >= HTTP_SERVER_RECLAIM_MIN_IDLE_MS / 2);
+    assert_true(waited < 3000);
+
+    (void)close(a);
+    (void)close(b);
+    (void)close(c);
+    stop_server(&server, run_task);
+}
+
 /* ------------------------------------------------------------------------- */
 
 int test_http_server()
@@ -1833,6 +2090,12 @@ int test_http_server()
         cmocka_unit_test(http_server_oversize_request_returns_413),
         cmocka_unit_test(http_server_handler_close_drops_connection),
         cmocka_unit_test(http_server_deferral_cancel_yields_503),
+
+        /* Idle timeout and idle-slot reclaim */
+        cmocka_unit_test(http_server_idle_connection_times_out),
+        cmocka_unit_test(http_server_reclaims_idle_slot_when_full),
+        cmocka_unit_test(http_server_does_not_reclaim_busy_slots),
+        cmocka_unit_test(http_server_admits_waiting_client_once_a_slot_goes_idle),
 
         /* Client-side chunked decoding */
         cmocka_unit_test(http_client_decodes_chunked_response),

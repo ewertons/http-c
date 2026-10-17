@@ -114,11 +114,70 @@ static http_server_connection_slot_t* acquire_slot(http_server_t* server)
             slot->pending_ready       = false;
             slot->pending_cancelled   = false;
             slot->pending_deadline_ms = 0;
+            slot->last_activity_ms    = now_ms();
             (void)memset(&slot->connection, 0, sizeof(slot->connection));
             return slot;
         }
     }
     return NULL;
+}
+
+/* Re-arm the listener if it was unregistered while every slot was busy.
+ * Loop thread only. */
+static void listener_rearm(http_server_t* server)
+{
+    if (server != NULL && !server->listen_registered &&
+        server_get_state(server) == http_server_state_running)
+    {
+        int listen_sd = server->local_endpoint.socket.listen_sd;
+        if (listen_sd != -1 &&
+            event_loop_register(&server->loop, listen_sd,
+                                event_loop_event_read,
+                                on_listen_readable, server) == ok)
+        {
+            server->listen_registered = true;
+        }
+    }
+}
+
+/* States in which the server is waiting on the peer, so a lack of progress
+ * is the peer's doing. `pending` waits on the application instead and has
+ * its own deadline. */
+static bool slot_waits_on_peer(const http_server_connection_slot_t* slot)
+{
+    return slot->in_use &&
+           (slot->state == http_slot_state_handshaking ||
+            slot->state == http_slot_state_receiving ||
+            slot->state == http_slot_state_sending);
+}
+
+/* Idle between requests: nothing of a next request has arrived and no
+ * response is in flight, so closing it loses nothing a well-behaved client
+ * cannot retry (RFC 9112 9.3.1 lets either side close an idle connection). */
+static bool slot_is_idle_between_requests(const http_server_connection_slot_t* slot)
+{
+    return slot->in_use &&
+           slot->state == http_slot_state_receiving &&
+           slot->recv_used == 0;
+}
+
+/* The longest-idle connection that may be closed to admit a new client,
+ * or NULL if none has been idle for HTTP_SERVER_RECLAIM_MIN_IDLE_MS. */
+static http_server_connection_slot_t* find_reclaimable_slot(http_server_t* server,
+                                                            uint64_t       now)
+{
+    http_server_connection_slot_t* oldest = NULL;
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+        if (slot_is_idle_between_requests(slot) &&
+            now >= slot->last_activity_ms + HTTP_SERVER_RECLAIM_MIN_IDLE_MS &&
+            (oldest == NULL || slot->last_activity_ms < oldest->last_activity_ms))
+        {
+            oldest = slot;
+        }
+    }
+    return oldest;
 }
 
 static void release_slot(http_server_connection_slot_t* slot)
@@ -151,18 +210,7 @@ static void release_slot(http_server_connection_slot_t* slot)
     /* A slot just became free; if the listener was unregistered while all
      * slots were busy, re-arm it. We're on the loop thread so this is
      * safe without any cross-thread signalling. */
-    if (server != NULL && !server->listen_registered &&
-        server_get_state(server) == http_server_state_running)
-    {
-        int listen_sd = server->local_endpoint.socket.listen_sd;
-        if (listen_sd != -1 &&
-            event_loop_register(&server->loop, listen_sd,
-                                event_loop_event_read,
-                                on_listen_readable, server) == ok)
-        {
-            server->listen_registered = true;
-        }
-    }
+    listener_rearm(server);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -319,6 +367,7 @@ static void slot_drive_handshake(http_server_connection_slot_t* slot)
     if (r == ok)
     {
         slot->state = http_slot_state_receiving;
+        slot->last_activity_ms = now_ms();
         http_request_parser_init(&slot->parser);
         slot_arm(slot, event_loop_event_read);
         return;
@@ -379,6 +428,10 @@ static void slot_drive_receive(http_server_connection_slot_t* slot)
         }
 
         slot->recv_used += got;
+        if (got > 0)
+        {
+            slot->last_activity_ms = now_ms();
+        }
 
         span_t buf = span_init(slot->recv_buffer_ptr, slot->recv_used);
         result_t pr = http_request_parser_feed(&slot->parser, buf);
@@ -561,6 +614,9 @@ static void serialize_and_send(http_server_connection_slot_t* slot,
     slot->send_used   = bs.used;
     slot->send_offset = 0;
     slot->state       = http_slot_state_sending;
+    /* The idle clock restarts here: time spent in a handler or parked on a
+     * deferral is not the peer's to answer for. */
+    slot->last_activity_ms = now_ms();
     slot_arm(slot, event_loop_event_write);
 }
 
@@ -606,6 +662,7 @@ static void slot_finish_send(http_server_connection_slot_t* slot)
     slot->send_used   = 0;
     slot->send_offset = 0;
     slot->state       = http_slot_state_receiving;
+    slot->last_activity_ms = now_ms();
     http_request_parser_init(&slot->parser);
 
     if (slot->recv_used > 0)
@@ -640,6 +697,10 @@ static void slot_drive_send(http_server_connection_slot_t* slot)
             uint32_t written = 0;
             result_t r = socket_write_nb(&slot->connection.socket, to_send, &written);
             slot->send_offset += written;
+            if (written > 0)
+            {
+                slot->last_activity_ms = now_ms();
+            }
 
             if (r == ok)
             {
@@ -825,9 +886,53 @@ static void sweep_pending_deadlines(http_server_t* server)
     }
 }
 
-/* How long the loop may sleep. With nothing parked we block indefinitely
- * and rely on event_loop_wake() from a completion; with something parked
- * we must surface in time to enforce its deadline. */
+/* Close connections that have made no progress for idle_timeout_ms while
+ * the server waited on the peer. Then, if the listener is parked because
+ * every slot was busy when a client connected, close the longest-idle
+ * connection to admit that client -- rather than leave it queued behind
+ * connections held open only in case they are reused. Closing a slot
+ * re-arms the listener (release_slot). Runs between loop iterations, never
+ * during dispatch. */
+static void sweep_idle_connections(http_server_t* server)
+{
+    uint64_t now = now_ms();
+
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+        if (slot_waits_on_peer(slot) &&
+            now >= slot->last_activity_ms + (uint64_t)server->idle_timeout_ms)
+        {
+            log_info("closing connection idle for %u ms", server->idle_timeout_ms);
+            slot_close(slot);
+        }
+    }
+
+    if (!server->listen_registered)
+    {
+        http_server_connection_slot_t* idle = find_reclaimable_slot(server, now);
+        if (idle != NULL)
+        {
+            log_info("all %u slots busy; closing the longest-idle connection",
+                     server->storage->slot_count);
+            slot_close(idle);
+        }
+    }
+}
+
+static void consider_deadline(uint64_t* soonest, bool* any, uint64_t deadline)
+{
+    if (!*any || deadline < *soonest)
+    {
+        *soonest = deadline;
+        *any     = true;
+    }
+}
+
+/* How long the loop may sleep. With nothing to time out we block
+ * indefinitely and rely on event_loop_wake() from a completion; otherwise
+ * we must surface in time to enforce the nearest deferral deadline, idle
+ * timeout, or -- while the listener is parked -- reclaim opportunity. */
 static int next_tick_ms(http_server_t* server)
 {
     uint64_t soonest = 0;
@@ -839,14 +944,25 @@ static int next_tick_ms(http_server_t* server)
         http_server_connection_slot_t* slot = &server->storage->slots[i];
         if (slot->in_use && slot->state == http_slot_state_pending)
         {
-            if (!any || slot->pending_deadline_ms < soonest)
-            {
-                soonest = slot->pending_deadline_ms;
-                any     = true;
-            }
+            consider_deadline(&soonest, &any, slot->pending_deadline_ms);
         }
     }
     (void)pthread_mutex_unlock(&server->pending_mutex);
+
+    for (uint32_t i = 0; i < server->storage->slot_count; i++)
+    {
+        http_server_connection_slot_t* slot = &server->storage->slots[i];
+        if (slot_waits_on_peer(slot))
+        {
+            consider_deadline(&soonest, &any,
+                              slot->last_activity_ms + (uint64_t)server->idle_timeout_ms);
+        }
+        if (!server->listen_registered && slot_is_idle_between_requests(slot))
+        {
+            consider_deadline(&soonest, &any,
+                              slot->last_activity_ms + HTTP_SERVER_RECLAIM_MIN_IDLE_MS);
+        }
+    }
 
     if (!any)
     {
@@ -1021,6 +1137,9 @@ result_t http_server_init(http_server_t* server, http_server_config_t* config, h
     server->pending_timeout_ms = (config->deferred_timeout_ms != 0)
                                     ? config->deferred_timeout_ms
                                     : HTTP_SERVER_DEFAULT_DEFERRED_TIMEOUT_MS;
+    server->idle_timeout_ms = (config->idle_timeout_ms != 0)
+                                    ? config->idle_timeout_ms
+                                    : HTTP_SERVER_DEFAULT_IDLE_TIMEOUT_MS;
 
     for (uint32_t i = 0; i < storage->slot_count; i++)
     {
@@ -1161,7 +1280,11 @@ static void on_listen_readable(int fd, uint32_t events, void* user)
     http_server_connection_slot_t* slot = acquire_slot(server);
     if (slot == NULL)
     {
-        /* All slots busy. Stop listening until a slot frees. */
+        /* All slots busy. Stop listening until a slot frees. The sweep
+         * after this loop iteration may free one at once by reclaiming an
+         * idle connection; that is done there rather than here so a slot
+         * is never closed while events for it may still be queued in the
+         * batch being dispatched (its fd could be reused by the accept). */
         (void)event_loop_unregister(&server->loop, fd);
         server->listen_registered = false;
         return;
@@ -1263,6 +1386,7 @@ result_t http_server_run(http_server_t* server)
         }
         flush_pending_responses(server);
         sweep_pending_deadlines(server);
+        sweep_idle_connections(server);
     }
 
     /* Tear down: close any in-flight connections and unregister fds. */

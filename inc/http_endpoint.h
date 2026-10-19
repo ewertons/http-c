@@ -49,6 +49,15 @@ typedef struct http_endpoint_config
      * to its caller, whose event loop already owns the timing. */
     uint32_t io_timeout_ms;
 
+    /* Optional HTTP CONNECT proxy for a client; ignored for a server. An
+     * empty hostname (the default) connects directly. Handed to the socket
+     * layer unchanged -- see proxy_host_config_t in socketx.h: the remote
+     * name is resolved by the proxy, TLS runs end-to-end through the tunnel
+     * and is verified against remote.hostname, and the spans must outlive
+     * the endpoint. http_endpoint_config_set_proxy_from_environment fills
+     * it from the usual environment variables. */
+    proxy_host_config_t proxy;
+
     struct
     {
         bool enable;
@@ -99,5 +108,55 @@ task_t* http_endpoint_wait_for_connection_async(http_endpoint_t* endpoint, http_
 result_t http_endpoint_connect(http_endpoint_t* endpoint, http_connection_t* connection);
 
 result_t http_endpoint_deinit(http_endpoint_t* endpoint);
+
+/* ------------------------------------------------------------------------- *
+ * Proxy configuration helpers.
+ *
+ * None of these allocate: every string they produce is written into the
+ * caller's `storage` (NUL-terminated, so it can also be logged or passed to C
+ * APIs), and the resulting spans point into it. Keep `storage` alive for as
+ * long as the configuration -- and any endpoint initialised from it -- is in
+ * use. 512 bytes is plenty for any ordinary proxy URL.
+ * ------------------------------------------------------------------------- */
+
+/* Parses a proxy URL of the form
+ *
+ *     [http://][user[:password]@]host[:port][/]
+ *
+ * into out_proxy. host may be a name, an IPv4 literal or a bracketed IPv6
+ * literal (stored without the brackets). Without a port the scheme's default
+ * applies, which for http is 80. user and password may be percent-encoded;
+ * when present they become a "Basic <base64(user:password)>" authorization.
+ * Only the http scheme is accepted (TLS to the proxy itself is not
+ * supported); a URL with no scheme is taken as http.
+ *
+ * Returns ok, invalid_argument for a malformed or unsupported URL, or
+ * insufficient_size when storage is too small. out_proxy is cleared on
+ * failure. */
+result_t http_endpoint_proxy_parse_url(span_t proxy_url, span_t storage, proxy_host_config_t* out_proxy);
+
+/* Whether `hostname` is excluded from proxying by a no_proxy-style list:
+ * comma-separated entries, surrounding blanks ignored, matched
+ * case-insensitively. "*" matches every host; any other entry matches the
+ * host itself and its subdomains, with or without a leading "." (so both
+ * "example.com" and ".example.com" match "example.com" and
+ * "api.example.com", but not "badexample.com"). A ":port" suffix on an entry
+ * is ignored. CIDR ranges are not supported. */
+bool http_endpoint_proxy_should_bypass(span_t no_proxy, span_t hostname);
+
+/* Sets configuration->proxy from the environment, the way curl does:
+ *
+ *   - https_proxy, then HTTPS_PROXY, when configuration->tls.enable is set;
+ *     http_proxy, then HTTP_PROXY, otherwise (the first non-empty one wins);
+ *   - no proxy when configuration->remote.hostname is listed in no_proxy
+ *     (or NO_PROXY), see http_endpoint_proxy_should_bypass;
+ *   - the value is parsed by http_endpoint_proxy_parse_url into storage.
+ *
+ * Set configuration->remote and configuration->tls.enable first. The proxy
+ * is cleared when the environment names none, and on failure.
+ *
+ * Returns ok (with or without a proxy), invalid_argument for a NULL
+ * configuration or a malformed proxy URL, or insufficient_size. */
+result_t http_endpoint_config_set_proxy_from_environment(http_endpoint_config_t* configuration, span_t storage);
 
 #endif // HTTP_ENDPOINT_H

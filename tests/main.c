@@ -24,6 +24,7 @@ int main()
   task_platform_init();
   result += test_http_endpoint();
   result += test_http_server();
+  result += test_http_client();
   task_platform_deinit();
 
   return result;

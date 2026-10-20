@@ -9,5 +9,6 @@ int test_http_response();
 int test_http_server();
 int test_http_endpoint();
 int test_http_server_storage();
+int test_http_client();
 
 #endif // TEST_HTTPS_LISTENER_H

@@ -200,6 +200,11 @@ typedef struct handler_capture
     span_t          response_body;
     bool            count_invocations;
     int             invocation_count;
+    /* Content-Length for the programmed response. Without it a keep-alive
+     * response has no end but the connection closing (RFC 9112 6.3), and a
+     * conforming client waits for that. */
+    uint8_t         response_header_storage[64];
+    uint8_t         content_length_storage[16];
 } handler_capture_t;
 
 static void handler_capture_init(handler_capture_t* h)
@@ -249,6 +254,12 @@ static http_handler_outcome_t capturing_handler(http_exchange_t* exchange, void*
     out_response->code          = h->response_code;
     out_response->reason_phrase = h->response_reason;
     out_response->body          = h->response_body;
+    out_response->headers.buffer    = span_from_memory(h->response_header_storage);
+    out_response->headers.used_size = 0;
+    out_response->headers.iterator  = SPAN_EMPTY;
+    (void)http_headers_add(&out_response->headers, HTTP_HEADER_CONTENT_LENGTH,
+                           span_copy_int32(span_from_memory(h->content_length_storage),
+                                           (int32_t)span_get_size(h->response_body), NULL));
 
     if (h->count_invocations)
     {

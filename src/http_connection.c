@@ -12,6 +12,7 @@
 #include "http_endpoint.h"
 #include "http_connection.h"
 #include "http_headers.h"
+#include "http_methods.h"
 
 /* CLOCK_MONOTONIC so a wall-clock adjustment cannot make a deadline fire
  * early or never. */
@@ -320,6 +321,31 @@ static result_t read_remaining_body(http_connection_t* connection,
     return ok;
 }
 
+/* Case-insensitive search for "chunked" anywhere in a Transfer-Encoding
+ * value (could be "chunked" or "gzip, chunked" etc.). */
+static bool transfer_encoding_is_chunked(span_t te_value)
+{
+    uint32_t te_len = span_get_size(te_value);
+    const char* te_str = (const char*)span_get_ptr(te_value);
+    if (te_len >= 7)
+    {
+        for (uint32_t i = 0; i + 7 <= te_len; i++)
+        {
+            if ((te_str[i]   == 'c' || te_str[i]   == 'C') &&
+                (te_str[i+1] == 'h' || te_str[i+1] == 'H') &&
+                (te_str[i+2] == 'u' || te_str[i+2] == 'U') &&
+                (te_str[i+3] == 'n' || te_str[i+3] == 'N') &&
+                (te_str[i+4] == 'k' || te_str[i+4] == 'K') &&
+                (te_str[i+5] == 'e' || te_str[i+5] == 'E') &&
+                (te_str[i+6] == 'd' || te_str[i+6] == 'D'))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static result_t maybe_read_body(http_connection_t* connection,
                                 http_headers_t* headers,
                                 span_t* body,
@@ -345,31 +371,7 @@ static result_t maybe_read_body(http_connection_t* connection,
     span_t te_value;
     if (http_headers_find(headers, HDR_TRANSFER_ENCODING, &te_value) == HL_RESULT_OK)
     {
-        /* Case-insensitive check for "chunked". */
-        uint32_t te_len = span_get_size(te_value);
-        const char* te_str = (const char*)span_get_ptr(te_value);
-        bool is_chunked = false;
-        if (te_len >= 7)
-        {
-            /* Look for "chunked" anywhere in the value (could be
-             * "chunked" or "gzip, chunked" etc.). */
-            for (uint32_t i = 0; i + 7 <= te_len; i++)
-            {
-                if ((te_str[i]   == 'c' || te_str[i]   == 'C') &&
-                    (te_str[i+1] == 'h' || te_str[i+1] == 'H') &&
-                    (te_str[i+2] == 'u' || te_str[i+2] == 'U') &&
-                    (te_str[i+3] == 'n' || te_str[i+3] == 'N') &&
-                    (te_str[i+4] == 'k' || te_str[i+4] == 'K') &&
-                    (te_str[i+5] == 'e' || te_str[i+5] == 'E') &&
-                    (te_str[i+6] == 'd' || te_str[i+6] == 'D'))
-                {
-                    is_chunked = true;
-                    break;
-                }
-            }
-        }
-
-        if (is_chunked)
+        if (transfer_encoding_is_chunked(te_value))
         {
             /* Dechunk in place, inside the caller's own buffer.
              *
@@ -398,7 +400,403 @@ static result_t maybe_read_body(http_connection_t* connection,
         }
     }
 
-    /* 3. No Content-Length, not chunked — no body. */
+    /* 3. No Content-Length, not chunked — no body. Only requests come
+     * through here, and for a request that is the rule (RFC 9112 section
+     * 6.3); responses are framed by read_response_body below. */
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Response bodies.                                                    */
+/*                                                                     */
+/* One reader serves both receive_response flavours. It reads into a   */
+/* window of the caller's buffer and hands each piece of body on:      */
+/*   - streaming: to the caller's handler, straight from the window,   */
+/*     which is then reused, so the body may be of any size;           */
+/*   - stored: copied down to the front of the window, where the body  */
+/*     accumulates. The copy is always to a lower address (framing     */
+/*     bytes are consumed, not stored), and the window is only ever    */
+/*     compacted down to the end of the stored body, never over it.    */
+/* ------------------------------------------------------------------ */
+
+typedef enum response_body_framing
+{
+    response_body_framing_none,
+    response_body_framing_content_length,
+    response_body_framing_chunked,
+    response_body_framing_until_close
+} response_body_framing_t;
+
+typedef struct response_body_reader
+{
+    http_connection_t* connection;
+    uint8_t* buffer;
+    uint32_t capacity;
+    uint32_t start;          /* first received byte not yet consumed */
+    uint32_t end;            /* end of the received bytes */
+    uint32_t stored_length;  /* stored mode: body bytes kept at buffer[0..) */
+    http_response_body_handler_t body_handler; /* NULL selects stored mode */
+    void* body_handler_context;
+} response_body_reader_t;
+
+/* Receives more bytes at the end of the window. Returns end_of_data when the
+ * peer has closed, insufficient_size when the window is full. */
+static result_t response_body_reader_fill(response_body_reader_t* reader)
+{
+    uint32_t floor = reader->stored_length;
+
+    if (reader->start == reader->end)
+    {
+        reader->start = floor;
+        reader->end   = floor;
+    }
+    else if (reader->end == reader->capacity && reader->start > floor)
+    {
+        uint32_t pending = reader->end - reader->start;
+        memmove(reader->buffer + floor, reader->buffer + reader->start, pending);
+        reader->start = floor;
+        reader->end   = floor + pending;
+    }
+
+    if (reader->end == reader->capacity)
+    {
+        return insufficient_size;
+    }
+
+    uint64_t deadline = io_deadline(reader->connection);
+
+    for (;;)
+    {
+        span_t received = SPAN_EMPTY;
+        result_t result = stream_read(&reader->connection->stream,
+                                      span_init(reader->buffer + reader->end,
+                                                reader->capacity - reader->end),
+                                      &received, NULL);
+        if (result == try_again)
+        {
+            result_t wait_result = await_progress(reader->connection, deadline);
+            if (is_error(wait_result)) return wait_result;
+            continue;
+        }
+        if (result == end_of_data || result == end_of_file)
+        {
+            return end_of_data;
+        }
+        if (is_error(result))
+        {
+            return result;
+        }
+        if (span_is_empty(received))
+        {
+            continue;
+        }
+        reader->end += span_get_size(received);
+        return ok;
+    }
+}
+
+static result_t response_body_reader_deliver(response_body_reader_t* reader, uint32_t length)
+{
+    uint8_t* piece = reader->buffer + reader->start;
+    reader->start += length;
+
+    if (reader->body_handler != NULL)
+    {
+        result_t result = reader->body_handler(reader->body_handler_context, span_init(piece, length));
+        return is_error(result) ? result : ok;
+    }
+
+    memmove(reader->buffer + reader->stored_length, piece, length);
+    reader->stored_length += length;
+    return ok;
+}
+
+/* Passes exactly `length` body bytes on; the peer closing first is an error. */
+static result_t response_body_reader_pass_through(response_body_reader_t* reader, uint32_t length)
+{
+    while (length > 0)
+    {
+        if (reader->start == reader->end)
+        {
+            result_t result = response_body_reader_fill(reader);
+            if (result == end_of_data)
+            {
+                log_error("http_connection: connection closed with %u body bytes outstanding", length);
+                return error;
+            }
+            if (is_error(result)) return result;
+        }
+
+        uint32_t available = reader->end - reader->start;
+        uint32_t take = available < length ? available : length;
+        result_t result = response_body_reader_deliver(reader, take);
+        if (is_error(result)) return result;
+        length -= take;
+    }
+    return ok;
+}
+
+/* Consumes one line and returns it without its CRLF (or bare LF). */
+static result_t response_body_reader_read_line(response_body_reader_t* reader, span_t* out_line)
+{
+    uint32_t scanned = 0;
+
+    for (;;)
+    {
+        for (uint32_t index = reader->start + scanned; index < reader->end; index++)
+        {
+            if (reader->buffer[index] == '\n')
+            {
+                uint32_t line_end = index;
+                if (line_end > reader->start && reader->buffer[line_end - 1] == '\r')
+                {
+                    line_end--;
+                }
+                *out_line = span_init(reader->buffer + reader->start, line_end - reader->start);
+                reader->start = index + 1;
+                return ok;
+            }
+        }
+        scanned = reader->end - reader->start;
+
+        result_t result = response_body_reader_fill(reader);
+        if (result == end_of_data)
+        {
+            log_error("http_connection: connection closed inside chunked framing");
+            return error;
+        }
+        if (result == insufficient_size)
+        {
+            log_error("http_connection: chunked framing line does not fit the buffer");
+        }
+        if (is_error(result)) return result;
+    }
+}
+
+static result_t response_body_reader_chunked(response_body_reader_t* reader)
+{
+    for (;;)
+    {
+        span_t line;
+        result_t result = response_body_reader_read_line(reader, &line);
+        if (is_error(result)) return result;
+
+        uint32_t chunk_size = 0;
+        uint32_t digits = 0;
+        uint32_t index = 0;
+        for (; index < span_get_size(line); index++)
+        {
+            uint8_t character = span_get(line, index);
+            uint32_t value;
+            if      (character >= '0' && character <= '9') value = (uint32_t)(character - '0');
+            else if (character >= 'a' && character <= 'f') value = (uint32_t)(character - 'a' + 10);
+            else if (character >= 'A' && character <= 'F') value = (uint32_t)(character - 'A' + 10);
+            else break;
+
+            if (chunk_size > (UINT32_MAX >> 4))
+            {
+                log_error("http_connection: chunk size overflows");
+                return error;
+            }
+            chunk_size = (chunk_size << 4) | value;
+            digits++;
+        }
+
+        /* After the size only whitespace or a chunk extension may follow. */
+        uint8_t next = index < span_get_size(line) ? span_get(line, index) : (uint8_t)';';
+        if (digits == 0 || (next != ';' && next != ' ' && next != '\t'))
+        {
+            log_error("http_connection: malformed chunk size line");
+            return error;
+        }
+
+        if (chunk_size == 0)
+        {
+            /* Trailer fields, discarded, up to the empty line. */
+            do
+            {
+                result = response_body_reader_read_line(reader, &line);
+                if (is_error(result)) return result;
+            } while (!span_is_empty(line));
+            return ok;
+        }
+
+        result = response_body_reader_pass_through(reader, chunk_size);
+        if (is_error(result)) return result;
+
+        result = response_body_reader_read_line(reader, &line);
+        if (is_error(result)) return result;
+        if (!span_is_empty(line))
+        {
+            log_error("http_connection: chunk data not followed by CRLF");
+            return error;
+        }
+    }
+}
+
+static result_t response_body_reader_until_close(response_body_reader_t* reader)
+{
+    for (;;)
+    {
+        if (reader->start < reader->end)
+        {
+            result_t result = response_body_reader_deliver(reader, reader->end - reader->start);
+            if (is_error(result)) return result;
+        }
+
+        result_t result = response_body_reader_fill(reader);
+        if (result == end_of_data) return ok;
+        if (is_error(result)) return result;
+    }
+}
+
+/* RFC 9112 section 6.3, for a response. */
+static result_t determine_response_body_framing(http_connection_t* connection,
+                                                http_response_t* response,
+                                                response_body_framing_t* out_framing,
+                                                uint32_t* out_content_length)
+{
+    static const span_t HDR_CONTENT_LENGTH = span_from_str_literal("Content-Length");
+    static const span_t HDR_TRANSFER_ENCODING = span_from_str_literal("Transfer-Encoding");
+
+    uint32_t status = 0;
+    if (span_get_size(response->code) != 3 || span_to_uint32_t(response->code, &status) != 0)
+    {
+        log_error("http_connection: malformed response status code");
+        return error;
+    }
+
+    *out_content_length = 0;
+
+    if ((status >= 100 && status <= 199) || status == 204 || status == 304 ||
+        connection->awaiting_response_to_head)
+    {
+        *out_framing = response_body_framing_none;
+        return ok;
+    }
+
+    /* Content-Length first, as for requests (maybe_read_body). */
+    span_t value;
+    if (http_headers_find(&response->headers, HDR_CONTENT_LENGTH, &value) == HL_RESULT_OK)
+    {
+        if (span_to_uint32_t(value, out_content_length) != 0)
+        {
+            log_error("http_connection: malformed Content-Length");
+            return error;
+        }
+        *out_framing = *out_content_length == 0 ? response_body_framing_none
+                                                : response_body_framing_content_length;
+        return ok;
+    }
+
+    if (http_headers_find(&response->headers, HDR_TRANSFER_ENCODING, &value) == HL_RESULT_OK &&
+        transfer_encoding_is_chunked(value))
+    {
+        *out_framing = response_body_framing_chunked;
+        return ok;
+    }
+
+    *out_framing = response_body_framing_until_close;
+    return ok;
+}
+
+/* Reads the status line and headers into buffer, then the body: stored
+ * after the headers when body_handler is NULL, otherwise streamed to it. */
+static result_t receive_response(http_connection_t* connection,
+                                 span_t buffer,
+                                 http_response_t* response,
+                                 http_response_body_handler_t body_handler,
+                                 void* body_handler_context,
+                                 span_t* out_buffer_remainder)
+{
+    span_t received, remainder;
+    result_t result = read_until_headers_complete(connection, buffer, &received, &remainder);
+
+    if (is_error(result))
+    {
+        return result;
+    }
+    if (result == end_of_data || result == end_of_file)
+    {
+        log_error("http_connection: connection closed before the response headers were complete");
+        return error;
+    }
+
+    result = http_response_parse(response, received, NULL);
+    if (is_error(result))
+    {
+        return result;
+    }
+
+    /* Body bytes that arrived with the headers sit right before the unused
+     * remainder of the buffer; together they are the body's window. */
+    span_t prefetched = response->body;
+    response->body = SPAN_EMPTY;
+
+    response_body_reader_t reader;
+    (void)memset(&reader, 0, sizeof(reader));
+    reader.connection = connection;
+    reader.buffer     = !span_is_empty(prefetched) ? span_get_ptr(prefetched) : span_get_ptr(remainder);
+    reader.capacity   = span_get_size(prefetched) + span_get_size(remainder);
+    reader.end        = span_get_size(prefetched);
+    reader.body_handler         = body_handler;
+    reader.body_handler_context = body_handler_context;
+
+    response_body_framing_t framing;
+    uint32_t content_length;
+    result = determine_response_body_framing(connection, response, &framing, &content_length);
+    if (is_error(result))
+    {
+        return result;
+    }
+
+    /* An interim (1xx) response is followed by the real one, which is still
+     * the answer to the HEAD request. */
+    if (span_get_size(response->code) == 3 && span_get(response->code, 0) != '1')
+    {
+        connection->awaiting_response_to_head = false;
+    }
+
+    switch (framing)
+    {
+        case response_body_framing_content_length:
+            result = response_body_reader_pass_through(&reader, content_length);
+            break;
+        case response_body_framing_chunked:
+            result = response_body_reader_chunked(&reader);
+            break;
+        case response_body_framing_until_close:
+            result = response_body_reader_until_close(&reader);
+            break;
+        case response_body_framing_none:
+        default:
+            result = ok;
+            break;
+    }
+
+    if (result == insufficient_size)
+    {
+        log_error("http_connection: response body does not fit the %u byte buffer area after the headers",
+                  reader.capacity);
+    }
+    if (is_error(result))
+    {
+        return result;
+    }
+
+    if (body_handler == NULL && reader.stored_length > 0)
+    {
+        response->body = span_init(reader.buffer, reader.stored_length);
+    }
+
+    if (out_buffer_remainder != NULL)
+    {
+        *out_buffer_remainder = reader.capacity > reader.stored_length
+                                    ? span_init(reader.buffer + reader.stored_length,
+                                                reader.capacity - reader.stored_length)
+                                    : SPAN_EMPTY;
+    }
+
     return ok;
 }
 
@@ -474,6 +872,8 @@ result_t http_connection_send_request(http_connection_t* connection, http_reques
     else
     {
         result = http_request_serialize_to(request, &connection->stream);
+        connection->awaiting_response_to_head =
+            span_compare(request->method, HTTP_METHOD_HEAD) == 0;
     }
 
     return result;
@@ -486,40 +886,17 @@ result_t http_connection_receive_response(http_connection_t* connection, span_t 
         return invalid_argument;
     }
 
-    span_t received, remainder;
-    result_t result = read_until_headers_complete(connection, buffer, &received, &remainder);
+    return receive_response(connection, buffer, response, NULL, NULL, out_buffer_remainder);
+}
 
-    if (is_error(result))
+result_t http_connection_receive_response_streaming(http_connection_t* connection, span_t header_buffer, http_response_t* response, http_response_body_handler_t body_handler, void* body_handler_context)
+{
+    if (connection == NULL || response == NULL || body_handler == NULL)
     {
-        return result;
+        return invalid_argument;
     }
 
-    result = http_response_parse(response, received, NULL);
-    if (is_error(result))
-    {
-        return result;
-    }
-
-    result = maybe_read_body(connection, &response->headers, &response->body, remainder);
-    if (is_error(result))
-    {
-        return result;
-    }
-
-    if (out_buffer_remainder != NULL)
-    {
-        uint32_t body_len = span_get_size(response->body);
-        if (body_len <= span_get_size(remainder))
-        {
-            *out_buffer_remainder = span_slice_to_end(remainder, body_len);
-        }
-        else
-        {
-            *out_buffer_remainder = SPAN_EMPTY;
-        }
-    }
-
-    return ok;
+    return receive_response(connection, header_buffer, response, body_handler, body_handler_context, NULL);
 }
 
 result_t http_connection_close(http_connection_t* connection)
